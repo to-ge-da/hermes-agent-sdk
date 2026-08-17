@@ -307,3 +307,16 @@ def test_extract_cursor_images_from_vision_tool_call_path(tmp_path):
     ]
     images = extract_cursor_images(messages)
     assert images == [{"path": str(png)}]
+
+
+def test_extract_cursor_images_from_namespace_tool_calls(tmp_path):
+    png = tmp_path / "f003.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    fn = SimpleNamespace(name="vision_analyze", arguments=json.dumps({"image_url": str(png)}))
+    call = SimpleNamespace(function=fn)
+    messages = [
+        {"role": "assistant", "tool_calls": [call]},
+        {"role": "tool", "content": "Image loaded into your context"},
+    ]
+    images = extract_cursor_images(messages)
+    assert images == [{"path": str(png)}]

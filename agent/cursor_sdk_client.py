@@ -146,16 +146,26 @@ def _iter_tool_call_image_urls(message: dict[str, Any]) -> list[str]:
     """Native vision results are often text-only; the path is in the tool call."""
     urls: list[str] = []
     calls = message.get("tool_calls")
-    if not isinstance(calls, list):
+    if calls is None:
         return urls
+    if not isinstance(calls, list):
+        calls = [calls]
     for call in calls:
-        fn = call.get("function") if isinstance(call, dict) else None
-        if not isinstance(fn, dict):
-            continue
-        name = str(fn.get("name") or "")
+        fn = None
+        if isinstance(call, dict):
+            fn = call.get("function")
+        else:
+            fn = getattr(call, "function", None)
+        name = ""
+        raw: Any = None
+        if isinstance(fn, dict):
+            name = str(fn.get("name") or "")
+            raw = fn.get("arguments")
+        elif fn is not None:
+            name = str(getattr(fn, "name", "") or "")
+            raw = getattr(fn, "arguments", None)
         if name not in {"vision_analyze", "vision_analyze_tool"}:
             continue
-        raw = fn.get("arguments")
         args: Any = raw
         if isinstance(raw, str):
             try:
