@@ -3624,6 +3624,14 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "CURSOR_API_KEY": {
+        "description": "Cursor dashboard API key (crsr_…)",
+        "prompt": "Cursor API key",
+        "url": "https://cursor.com/dashboard/api",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
     "XAI_BASE_URL": {
         "description": "xAI base URL override",
         "prompt": "xAI base URL (leave empty for default)",

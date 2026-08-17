@@ -2348,6 +2348,12 @@ def _maybe_wrap_anthropic(
             return client_obj
     except ImportError:
         pass
+    try:
+        from agent.cursor_sdk_client import CursorSDKClient
+        if _safe_isinstance(client_obj, CursorSDKClient):
+            return client_obj
+    except ImportError:
+        pass
 
     # Explicit non-anthropic api_mode wins over URL heuristics.
     if api_mode and api_mode != "anthropic_messages":
@@ -3565,7 +3571,11 @@ def _validate_base_url(base_url: str) -> None:
     from urllib.parse import urlparse
 
     candidate = str(base_url or "").strip()
-    if not candidate or candidate.startswith("acp://"):
+    if (
+        not candidate
+        or candidate.startswith("acp://")
+        or candidate.startswith("cursor-sdk://")
+    ):
         return
     try:
         parsed = urlparse(candidate)
@@ -6008,6 +6018,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
+            return sync_client, model
+    except ImportError:
+        pass
+    try:
+        from agent.cursor_sdk_client import CursorSDKClient
+        if isinstance(sync_client, CursorSDKClient):
             return sync_client, model
     except ImportError:
         pass

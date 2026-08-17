@@ -2483,6 +2483,23 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(getattr(agent, "provider", "") or "")
+    except Exception:
+        profile = None
+    if profile is not None:
+        custom = profile.build_openai_client(**client_kwargs)
+        if custom is not None:
+            _ra().logger.info(
+                "%s client created (%s, shared=%s) %s",
+                getattr(profile, "name", "custom"),
+                reason,
+                shared,
+                agent._client_log_context(),
+            )
+            return custom
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 

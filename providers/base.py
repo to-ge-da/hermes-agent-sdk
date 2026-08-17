@@ -167,6 +167,14 @@ class ProviderProfile:
         """
         return {}, {}
 
+    def build_openai_client(self, **kwargs: Any) -> Any | None:
+        """Return a custom OpenAI-client-compatible object, or None.
+
+        Used by providers that are not HTTP chat-completions (ACP, Agent SDK
+        shims). Default None keeps the standard OpenAI() construction path.
+        """
+        return None
+
     def default_vision_model(self) -> str | None:
         """Return a default vision model id for this provider, or None.
 

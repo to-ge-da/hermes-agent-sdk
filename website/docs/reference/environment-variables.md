@@ -95,6 +95,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 | `OLLAMA_API_KEY` | Ollama Cloud API key — managed Ollama catalog without local GPU ([ollama.com/settings/keys](https://ollama.com/settings/keys)) |
 | `OLLAMA_BASE_URL` | Override Ollama Cloud base URL (default: `https://ollama.com/v1`) |
 | `XAI_API_KEY` | xAI (Grok) API key for chat + TTS + web search ([console.x.ai](https://console.x.ai/)) |
+| `CURSOR_API_KEY` | Cursor dashboard API key (`crsr_…`) for the native `cursor` provider ([cursor.com/dashboard/api](https://cursor.com/dashboard/api)). Requires `cursor-sdk`. |
 | `XAI_BASE_URL` | Override xAI base URL (default: `https://api.x.ai/v1`) |
 | `MISTRAL_API_KEY` | Mistral API key for Voxtral TTS and Voxtral STT ([console.mistral.ai](https://console.mistral.ai)) |
 | `AWS_REGION` | AWS region for Bedrock inference (e.g. `us-east-1`, `eu-central-1`). Read by boto3. |

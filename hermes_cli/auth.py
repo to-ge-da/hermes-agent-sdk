@@ -447,6 +447,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("XAI_API_KEY",),
         base_url_env_var="XAI_BASE_URL",
     ),
+    "cursor": ProviderConfig(
+        id="cursor",
+        name="Cursor",
+        auth_type="api_key",
+        inference_base_url="cursor-sdk://local",
+        api_key_env_vars=("CURSOR_API_KEY",),
+    ),
     "nvidia": ProviderConfig(
         id="nvidia",
         name="NVIDIA NIM",
