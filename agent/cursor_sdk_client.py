@@ -55,8 +55,26 @@ def _message_text(message: dict[str, Any]) -> str:
     return str(content or "")
 
 
+def _unwrap_stored_content(content: Any) -> Any:
+    """Hermes DB sometimes stores multimodal as ``\\0json:[...]``."""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", "replace")
+    if isinstance(content, str):
+        text = content
+        if text.startswith("\0"):
+            text = text[1:]
+        if text.startswith("json:"):
+            try:
+                return json.loads(text[5:])
+            except json.JSONDecodeError:
+                return content
+        return content
+    return content
+
+
 def _iter_image_urls(content: Any) -> list[str]:
     urls: list[str] = []
+    content = _unwrap_stored_content(content)
     if isinstance(content, str):
         text = content.strip()
         if text.startswith("{") and "_multimodal" in text:

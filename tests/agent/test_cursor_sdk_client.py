@@ -269,3 +269,20 @@ def test_extract_cursor_images_from_native_vision_envelope():
     ]
     images = extract_cursor_images(messages)
     assert images == [{"data": "aaa", "mime_type": "image/png"}]
+
+
+def test_extract_cursor_images_from_hermes_nul_json_blob():
+    blob = (
+        "\0json:"
+        + json.dumps(
+            [
+                {"type": "text", "text": "Image loaded"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,bbb"},
+                },
+            ]
+        )
+    )
+    images = extract_cursor_images([{"role": "tool", "content": blob}])
+    assert images == [{"data": "bbb", "mime_type": "image/png"}]
