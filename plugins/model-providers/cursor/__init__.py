@@ -66,7 +66,7 @@ class CursorProfile(ProviderProfile):
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            items = data.get("items") or data.get("data") or []
+            items = data.get("items") or data.get("data") or data.get("models") or []
         else:
             return None
 

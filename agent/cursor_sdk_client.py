@@ -1,28 +1,298 @@
 """OpenAI-compatible shim over the official Cursor Agent SDK.
 
-Cursor has no public ``POST /v1/chat/completions``. Dashboard ``crsr_`` keys
-authenticate ``cursor-sdk`` (``Agent.prompt``). This client keeps Hermes as
-the harness: it flattens the Hermes transcript + tool schema into one prompt
-and maps ``<tool_call>`` blocks back to OpenAI tool_calls, same contract as
-``CopilotACPClient``.
+Cursor has no public POST /v1/chat/completions. Dashboard crsr_ keys talk to
+cursor-sdk. Hermes stays the harness: every Hermes tool is described with its
+real JSON schema, the model emits <tool_call> JSON, and Hermes executes it —
+same shape as Copilot ACP, without ACP wording (that makes Cursor walk the
+repo with its own tools).
 
-``cursor-sdk`` is an optional extra — import is lazy so CI and default
-installs do not need the proprietary package.
+Cursor-native tools stay off (tools=[], mcp_servers={}). That is not a Hermes
+allowlist; it is "do not give Cursor a second filesystem."
+
+A live Agent is reused across turns in this process. Cold start sends a
+windowed transcript; later turns send only the latest user line plus any
+trailing tool results. Do not flatten a 300k resume into Agent.prompt.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.copilot_acp_client import (
-    _extract_tool_calls_from_text,
-    _format_messages_as_prompt,
-)
+from agent.copilot_acp_client import _extract_tool_calls_from_text
 
 CURSOR_MARKER_BASE_URL = "cursor-sdk://local"
+
+# Size cap only — not a task-specific stub. Cursor Agent.prompt/create hangs
+# if the first send is a 300k Hermes resume.
+_COLD_TRANSCRIPT_CHARS = 48_000
+_TOOL_DESC_CHARS = 800
+_SYSTEM_CHARS = 12_000
+
+_agents: dict[str, Any] = {}
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "image_url" or part.get("image_url"):
+                    parts.append("[image]")
+                else:
+                    parts.append(str(part.get("text") or ""))
+            else:
+                parts.append(str(part))
+        return "".join(parts)
+    if isinstance(content, dict) and content.get("_multimodal"):
+        return str(content.get("text_summary") or content.get("text") or "[image]")
+    return str(content or "")
+
+
+def _iter_image_urls(content: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(content, str):
+        text = content.strip()
+        if text.startswith("{") and "_multimodal" in text:
+            try:
+                content = json.loads(text)
+            except json.JSONDecodeError:
+                return urls
+        elif text.startswith("data:image") or (
+            text.startswith("/") and _looks_like_image_path(text)
+        ):
+            urls.append(text)
+            return urls
+    if isinstance(content, dict) and content.get("_multimodal"):
+        content = content.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            image = part.get("image_url")
+            if isinstance(image, dict):
+                url = image.get("url")
+                if isinstance(url, str) and url.strip():
+                    urls.append(url.strip())
+            elif isinstance(image, str) and image.strip():
+                urls.append(image.strip())
+            elif part.get("type") == "image_url" and isinstance(part.get("url"), str):
+                urls.append(part["url"].strip())
+    return urls
+
+
+def _looks_like_image_path(path: str) -> bool:
+    lower = path.lower()
+    return lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+
+def extract_cursor_images(
+    messages: list[dict[str, Any]] | None,
+    *,
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    """Pull Hermes image_url / native-vision parts for Cursor SDKImage."""
+    found: list[str] = []
+    for message in reversed(messages or []):
+        if not isinstance(message, dict):
+            continue
+        for url in _iter_image_urls(message.get("content")):
+            if url not in found:
+                found.append(url)
+            if len(found) >= limit:
+                break
+        if len(found) >= limit:
+            break
+    found.reverse()
+    images: list[dict[str, Any]] = []
+    for url in found:
+        converted = _cursor_image_payload(url)
+        if converted:
+            images.append(converted)
+    return images
+
+
+def _cursor_image_payload(url: str) -> dict[str, Any] | None:
+    text = (url or "").strip()
+    if not text:
+        return None
+    if text.startswith("data:"):
+        header, _, b64 = text.partition(",")
+        if not b64:
+            return None
+        mime = "image/png"
+        if header.startswith("data:") and ";" in header:
+            mime = header[5:].split(";", 1)[0] or mime
+        return {"data": b64, "mime_type": mime}
+    if text.startswith("http://") or text.startswith("https://"):
+        return {"url": text}
+    path = Path(text).expanduser()
+    if path.is_file():
+        return {"path": str(path)}
+    return None
+
+
+def window_cursor_messages(
+    messages: list[dict[str, Any]],
+    *,
+    budget: int = _COLD_TRANSCRIPT_CHARS,
+) -> list[dict[str, Any]]:
+    """Keep system (truncated) plus a recent tail that includes the last user."""
+    typed = [m for m in messages if isinstance(m, dict)]
+    if not typed:
+        return []
+    systems = [m for m in typed if str(m.get("role") or "").lower() == "system"]
+    rest = [m for m in typed if str(m.get("role") or "").lower() != "system"]
+    kept_sys: list[dict[str, Any]] = []
+    for sys_msg in systems[:1]:
+        text = _message_text(sys_msg)
+        if len(text) > _SYSTEM_CHARS:
+            text = text[:_SYSTEM_CHARS] + "\n…[system truncated]"
+        kept_sys.append({"role": "system", "content": text})
+    if not rest:
+        return kept_sys
+    last_user_i = len(rest) - 1
+    for i in range(len(rest) - 1, -1, -1):
+        if str(rest[i].get("role") or "").lower() == "user":
+            last_user_i = i
+            break
+    tail: list[dict[str, Any]] = [rest[last_user_i]]
+    used = len(_message_text(rest[last_user_i]))
+    i = last_user_i - 1
+    while i >= 0 and used < budget:
+        msg = rest[i]
+        n = len(_message_text(msg))
+        if tail and used + n > budget:
+            break
+        tail.append(msg)
+        used += n
+        i -= 1
+    tail.reverse()
+    return kept_sys + tail
+
+
+def hermes_tools_spec(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Pass through every Hermes tool with its real parameter schema."""
+    if not isinstance(tools, list):
+        return []
+    specs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") or {}
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip() or name in seen:
+            continue
+        desc = str(fn.get("description") or "")
+        if len(desc) > _TOOL_DESC_CHARS:
+            desc = desc[:_TOOL_DESC_CHARS] + "…"
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            params = {"type": "object", "properties": {}}
+        specs.append(
+            {
+                "name": name.strip(),
+                "description": desc,
+                "parameters": params,
+            }
+        )
+        seen.add(name.strip())
+    return specs
+
+
+def format_hermes_cursor_prompt(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    resume: bool = False,
+) -> str:
+    """Hermes-as-harness prompt. No ACP wording. Full tool schemas."""
+    sections: list[str] = [
+        "You are the Hermes agent. Hermes executes tools locally.",
+        "If you need a tool, emit one or more "
+        "<tool_call>{\"id\":\"call_1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"NAME\",\"arguments\":\"{...}\"}}</tool_call> "
+        "blocks. arguments must be a JSON string. Do not use Cursor, ACP, or "
+        "workspace tools — only the Hermes tools listed below.",
+        "If no tool is needed, answer in plain text.",
+    ]
+    if model:
+        sections.append(f"Model hint: {model}")
+    specs = hermes_tools_spec(tools)
+    if specs:
+        sections.append(
+            "Hermes tools (OpenAI function schema):\n"
+            + json.dumps(specs, ensure_ascii=False)
+        )
+    if resume:
+        delta = _resume_delta(messages)
+        blocked = _blocked_reads(messages)
+        if blocked:
+            sections.append(
+                "Hermes already returned these paths. Do not read_file them again:\n"
+                + blocked
+            )
+        if delta:
+            sections.append("New turn:\n\n" + delta)
+        sections.append("Continue from the new turn. Do not re-open files you already have.")
+        return "\n\n".join(sections)
+
+    windowed = window_cursor_messages(messages)
+    transcript: list[str] = []
+    for message in windowed:
+        role = str(message.get("role") or "context").strip().lower()
+        label = {
+            "system": "System",
+            "user": "User",
+            "assistant": "Assistant",
+            "tool": "Tool",
+        }.get(role, "Context")
+        text = _message_text(message).strip()
+        if text:
+            transcript.append(f"{label}:\n{text}")
+    if transcript:
+        sections.append("Conversation:\n\n" + "\n\n".join(transcript))
+    sections.append("Continue from the latest user request.")
+    return "\n\n".join(sections)
+
+
+def _resume_delta(messages: list[dict[str, Any]]) -> str:
+    """Latest user text plus trailing tool results (the Hermes turn delta)."""
+    typed = [m for m in messages if isinstance(m, dict)]
+    if not typed:
+        return ""
+    last_user = None
+    last_user_i = 0
+    for i in range(len(typed) - 1, -1, -1):
+        if str(typed[i].get("role") or "").lower() == "user":
+            last_user = typed[i]
+            last_user_i = i
+            break
+    parts: list[str] = []
+    if last_user is not None:
+        parts.append("User:\n" + _message_text(last_user).strip())
+        for message in typed[last_user_i + 1 :]:
+            role = str(message.get("role") or "").lower()
+            text = _message_text(message).strip()
+            if not text:
+                continue
+            if role == "tool":
+                parts.append("Tool:\n" + text)
+            elif role == "assistant":
+                parts.append("Assistant:\n" + text)
+    else:
+        parts.append(_message_text(typed[-1]).strip())
+    return "\n\n".join(p for p in parts if p)
 
 
 def normalize_cursor_model_id(model_id: str) -> str:
@@ -55,6 +325,27 @@ def expand_cursor_model_ids(raw_ids: list[str]) -> list[str]:
     return out
 
 
+def cursor_sdk_model(model_id: str) -> str | dict[str, Any]:
+    """SDK inference id plus high / not-fast params.
+
+    Live 2026-08-17: Agent.prompt accepts ``grok-4.6``, not catalog
+    ``cursor-grok-4.6-high-fast``. Bare ``grok-4.6`` is the high-fast SKU
+    (no reasoning_tokens). ``params: [{id: fast, value: false}]`` is the
+    only setting that produced reasoning tokens. ``grok-4.6-high`` is
+    rejected. This session stays on grok-4.6 high without fast.
+    """
+    alias = normalize_cursor_model_id(model_id) or (model_id or "").strip() or "grok-4.6"
+    if alias.startswith("grok-"):
+        return {
+            "id": alias,
+            "params": [
+                {"id": "fast", "value": "false"},
+                {"id": "reasoning", "value": "high"},
+            ],
+        }
+    return alias
+
+
 class _CursorChatCompletions:
     def __init__(self, client: "CursorSDKClient") -> None:
         self._client = client
@@ -69,7 +360,7 @@ class _CursorChatNamespace:
 
 
 class CursorSDKClient:
-    """Minimal OpenAI-client facade for cursor-sdk Agent.prompt()."""
+    """OpenAI-client facade over a stateful cursor-sdk Agent."""
 
     def __init__(
         self,
@@ -88,6 +379,19 @@ class CursorSDKClient:
     def close(self) -> None:
         self.is_closed = True
 
+    def _slot_key(self, model: str) -> str:
+        cwd = (
+            os.environ.get("HERMES_CURSOR_SDK_CWD")
+            or os.environ.get("CURSOR_SDK_CWD")
+            or str(Path.cwd().resolve())
+        )
+        session = (
+            os.environ.get("HERMES_SESSION_ID")
+            or os.environ.get("HERMES_CURSOR_SESSION")
+            or "default"
+        )
+        return f"{session}::{model}::high-nofast::{cwd}"
+
     def _create_chat_completion(
         self,
         *,
@@ -99,15 +403,28 @@ class CursorSDKClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
+        del timeout, tool_choice
+        model_id = model or "grok-4.6"
+        slot = self._slot_key(model_id)
+        resume = slot in _agents
+        prompt_text = format_hermes_cursor_prompt(
             messages or [],
-            model=model,
+            model=model_id,
             tools=tools,
-            tool_choice=tool_choice,
+            resume=resume,
         )
-        response_text = self._run_prompt(prompt_text, model=model or "grok-4.6")
+        images = extract_cursor_images(messages or [])
+        try:
+            Path("/tmp/cursor_prompt_len.txt").write_text(
+                f"chars={len(prompt_text)} tools={len(hermes_tools_spec(tools))} "
+                f"resume={resume} images={len(images)}\n"
+            )
+        except Exception:
+            pass
+        response_text = self._run_turn(
+            prompt_text, model=model_id, resume=resume, images=images
+        )
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-
         usage = SimpleNamespace(
             prompt_tokens=0,
             completion_tokens=0,
@@ -122,11 +439,12 @@ class CursorSDKClient:
             reasoning_details=None,
         )
         finish_reason = "tool_calls" if tool_calls else "stop"
-        choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         completion = SimpleNamespace(
-            choices=[choice],
+            choices=[
+                SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
+            ],
             usage=usage,
-            model=model or "grok-4.6",
+            model=model_id,
         )
         if stream:
             from agent.copilot_acp_client import _completion_to_stream_chunks
@@ -135,6 +453,18 @@ class CursorSDKClient:
         return completion
 
     def _run_prompt(self, prompt_text: str, *, model: str) -> str:
+        """Test hook / oneshot path: one Agent.prompt, no session cache."""
+        return self._run_turn(prompt_text, model=model, resume=False, oneshot=True)
+
+    def _run_turn(
+        self,
+        prompt_text: str,
+        *,
+        model: str,
+        resume: bool,
+        oneshot: bool = False,
+        images: list[dict[str, Any]] | None = None,
+    ) -> str:
         if not self.api_key:
             raise RuntimeError(
                 "CURSOR_API_KEY is not set. Create a key at "
@@ -148,19 +478,92 @@ class CursorSDKClient:
                 "Install it into the Hermes environment: pip install cursor-sdk"
             ) from exc
 
-        cwd = str(Path.cwd().resolve())
-        result = Agent.prompt(
-            prompt_text,
-            options={
-                "model": model,
-                "api_key": self.api_key,
-                "local": {"cwd": cwd},
-                "mcp_servers": {},
-            },
-        )
-        text = getattr(result, "result", None)
+        cwd = (
+            os.environ.get("HERMES_CURSOR_SDK_CWD")
+            or os.environ.get("CURSOR_SDK_CWD")
+            or ""
+        ).strip()
+        if not cwd:
+            cwd = str(Path.cwd().resolve())
+
+        try:
+            Path("/tmp/cursor_model_sel.txt").write_text(
+                json.dumps(cursor_sdk_model(model), sort_keys=True)
+            )
+        except Exception:
+            pass
+        options = {
+            "model": cursor_sdk_model(model),
+            "api_key": self.api_key,
+            "local": {"cwd": cwd},
+            "mcp_servers": {},
+            "tools": [],
+        }
+
+        if oneshot:
+            result = Agent.prompt(_cursor_user_message(prompt_text, images), options=options)
+            text = getattr(result, "result", None)
+            if isinstance(text, str):
+                return text
+            return "" if text is None else str(text)
+
+        slot = self._slot_key(model)
+        agent = _agents.get(slot) if resume else None
+        if agent is None:
+            agent = Agent.create(options=options)
+            _agents[slot] = agent
+        run = agent.send(_cursor_user_message(prompt_text, images))
+        wait = getattr(run, "wait", None)
+        if callable(wait):
+            wait()
+        text = getattr(run, "text", None)
+        if callable(text):
+            text = text()
         if isinstance(text, str):
             return text
-        if text is None:
-            return ""
-        return str(text)
+        result = getattr(run, "result", None)
+        if isinstance(result, str):
+            return result
+        return "" if text is None else str(text or "")
+
+
+def _cursor_user_message(
+    prompt_text: str, images: list[dict[str, Any]] | None
+) -> str | dict[str, Any]:
+    if not images:
+        return prompt_text
+    resolved: list[dict[str, Any]] = []
+    for image in images:
+        path = image.get("path") if isinstance(image, dict) else None
+        if isinstance(path, str) and Path(path).is_file():
+            import mimetypes
+
+            mime = mimetypes.guess_type(path)[0] or "image/png"
+            raw = Path(path).read_bytes()
+            import base64
+
+            resolved.append(
+                {"data": base64.b64encode(raw).decode("ascii"), "mime_type": mime}
+            )
+        elif isinstance(image, dict):
+            resolved.append(image)
+    if not resolved:
+        return prompt_text
+    return {"text": prompt_text, "images": resolved}
+
+
+def _blocked_reads(messages: list[dict[str, Any]]) -> str:
+    """Call out Hermes BLOCKED read_file results so the model stops retrying."""
+    hits: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").lower() != "tool":
+            continue
+        text = _message_text(message)
+        if "BLOCKED: You have called read_file" not in text:
+            continue
+        snippet = text.replace("\n", " ").strip()[:240]
+        if snippet not in hits:
+            hits.append(snippet)
+    return "\n".join(hits[-6:])

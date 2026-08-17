@@ -8,8 +8,13 @@ from unittest.mock import patch
 
 from agent.cursor_sdk_client import (
     CursorSDKClient,
+    cursor_sdk_model,
+    extract_cursor_images,
     expand_cursor_model_ids,
+    format_hermes_cursor_prompt,
+    hermes_tools_spec,
     normalize_cursor_model_id,
+    window_cursor_messages,
 )
 
 
@@ -17,6 +22,15 @@ def test_normalize_cursor_model_id_strips_catalog_affixes():
     assert normalize_cursor_model_id("cursor-grok-4.6-high-fast") == "grok-4.6"
     assert normalize_cursor_model_id("grok-4.6") == "grok-4.6"
     assert normalize_cursor_model_id("composer-2.5") == "composer-2.5"
+
+
+def test_cursor_sdk_model_uses_high_without_fast_for_grok():
+    sel = cursor_sdk_model("grok-4.6")
+    assert sel["id"] == "grok-4.6"
+    params = {p["id"]: p["value"] for p in sel["params"]}
+    assert params["fast"] == "false"
+    assert params["reasoning"] == "high"
+    assert cursor_sdk_model("composer-2.5") == "composer-2.5"
 
 
 def test_expand_cursor_model_ids_adds_short_aliases():
@@ -55,6 +69,35 @@ def test_fetch_models_parses_items_shape():
     assert "composer-2.5" in models
 
 
+def test_fetch_models_parses_live_models_list_shape():
+    from providers import get_provider_profile
+
+    payload = json.dumps(
+        {"models": ["cursor-grok-4.6-high-fast", "composer-2.5"]}
+    ).encode()
+
+    class _Resp:
+        def read(self):
+            return payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    profile = get_provider_profile("cursor")
+    assert profile is not None
+    with patch(
+        "hermes_cli.urllib_security.open_credentialed_url",
+        return_value=_Resp(),
+    ):
+        models = profile.fetch_models(api_key="crsr_test")
+    assert models is not None
+    assert "grok-4.6" in models
+    assert "composer-2.5" in models
+
+
 def test_cursor_client_maps_text_and_tool_calls():
     client = CursorSDKClient(api_key="crsr_test")
     tool_text = (
@@ -63,7 +106,7 @@ def test_cursor_client_maps_text_and_tool_calls():
         '"function":{"name":"terminal","arguments":"{\\"command\\":\\"uname\\"}"}}'
         "</tool_call>"
     )
-    with patch.object(client, "_run_prompt", return_value=tool_text):
+    with patch.object(client, "_run_turn", return_value=tool_text):
         completion = client.chat.completions.create(
             model="grok-4.6",
             messages=[{"role": "user", "content": "uname"}],
@@ -72,7 +115,7 @@ def test_cursor_client_maps_text_and_tool_calls():
     assert completion.choices[0].finish_reason == "tool_calls"
     assert completion.choices[0].message.tool_calls[0].function.name == "terminal"
 
-    with patch.object(client, "_run_prompt", return_value="NATIVE_CURSOR_OK"):
+    with patch.object(client, "_run_turn", return_value="NATIVE_CURSOR_OK"):
         done = client.chat.completions.create(
             model="grok-4.6",
             messages=[{"role": "user", "content": "ping"}],
@@ -129,3 +172,100 @@ def test_create_openai_client_uses_profile_hook():
             shared=False,
         )
     assert client is fake_client
+
+
+def test_window_cursor_messages_keeps_latest_user_and_caps_tail():
+    messages = [{"role": "system", "content": "sys " * 100}]
+    messages.extend({"role": "assistant", "content": "x" * 4000} for _ in range(20))
+    messages.append({"role": "user", "content": "continue now"})
+    windowed = window_cursor_messages(messages, budget=12_000)
+    assert windowed[0]["role"] == "system"
+    assert windowed[-1]["content"] == "continue now"
+    body_chars = sum(len(str(m.get("content") or "")) for m in windowed)
+    assert body_chars < 30_000
+
+
+def test_hermes_tools_spec_keeps_all_tools_and_real_parameters():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "vision_analyze",
+                "description": "see",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"image_url": {"type": "string"}},
+                    "required": ["image_url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "cronjob",
+                "description": "schedule",
+                "parameters": {"type": "object", "properties": {"action": {"type": "string"}}},
+            },
+        },
+    ]
+    specs = hermes_tools_spec(tools)
+    names = [s["name"] for s in specs]
+    assert names == ["vision_analyze", "cronjob"]
+    assert specs[0]["parameters"]["required"] == ["image_url"]
+
+
+def test_format_prompt_is_not_acp_and_includes_tool_schema():
+    prompt = format_hermes_cursor_prompt(
+        [{"role": "user", "content": "see this"}],
+        model="grok-4.6",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "vision_analyze",
+                    "description": "see",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"image_url": {"type": "string"}},
+                        "required": ["image_url"],
+                    },
+                },
+            }
+        ],
+    )
+    assert "Use ACP capabilities" not in prompt
+    assert "active ACP agent backend" not in prompt
+    assert "vision_analyze" in prompt
+    assert "image_url" in prompt
+    assert "see this" in prompt
+
+
+def test_resume_prompt_includes_tool_result_delta():
+    prompt = format_hermes_cursor_prompt(
+        [
+            {"role": "user", "content": "open last.png"},
+            {"role": "assistant", "content": "looking"},
+            {"role": "tool", "content": "BLOCKED: already read"},
+        ],
+        tools=[],
+        resume=True,
+    )
+    assert "BLOCKED: already read" in prompt
+    assert "open last.png" in prompt
+
+
+def test_extract_cursor_images_from_native_vision_envelope():
+    messages = [
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Image loaded"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aaa"},
+                },
+            ],
+        }
+    ]
+    images = extract_cursor_images(messages)
+    assert images == [{"data": "aaa", "mime_type": "image/png"}]

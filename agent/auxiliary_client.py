@@ -5845,6 +5845,19 @@ def _resolve_auto_route(
             runtime_api_key = ""
             runtime_api_mode = ""
 
+    # Cursor Agent SDK is not an OpenAI chat endpoint. Same-model policy for
+    # auxiliary tasks (compression, titles, …) means the same Grok slug on
+    # xAI's HTTP API, not OpenRouter and not cursor-sdk://.
+    if main_provider in {"cursor", "cursor-sdk", "cursor-composer"}:
+        _cursor_model = main_model or "grok-4.6"
+        if _cursor_model.startswith("cursor-"):
+            _cursor_model = _cursor_model[len("cursor-"):]
+        main_provider = "xai-oauth"
+        main_model = _cursor_model or "grok-4.6"
+        runtime_base_url = ""
+        runtime_api_key = ""
+        runtime_api_mode = ""
+
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
