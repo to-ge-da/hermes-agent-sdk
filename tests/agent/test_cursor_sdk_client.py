@@ -286,3 +286,24 @@ def test_extract_cursor_images_from_hermes_nul_json_blob():
     )
     images = extract_cursor_images([{"role": "tool", "content": blob}])
     assert images == [{"data": "bbb", "mime_type": "image/png"}]
+
+
+def test_extract_cursor_images_from_vision_tool_call_path(tmp_path):
+    png = tmp_path / "f001.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "vision_analyze",
+                        "arguments": json.dumps({"image_url": str(png)}),
+                    }
+                }
+            ],
+        },
+        {"role": "tool", "content": "Image loaded into your context"},
+    ]
+    images = extract_cursor_images(messages)
+    assert images == [{"path": str(png)}]
