@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,7 +33,38 @@ _COLD_TRANSCRIPT_CHARS = 48_000
 _TOOL_DESC_CHARS = 800
 _SYSTEM_CHARS = 12_000
 
-_agents: dict[str, Any] = {}
+# One Cursor Agent per Hermes session. A slot also holds the in-flight Run
+# so a Hermes retry/timeout cannot send() while that run is still open.
+_slots: dict[str, dict[str, Any]] = {}
+_slots_guard = threading.Lock()
+
+
+def _slot_record(slot: str) -> dict[str, Any]:
+    with _slots_guard:
+        rec = _slots.get(slot)
+        if rec is None:
+            rec = {"agent": None, "run": None, "lock": threading.Lock()}
+            _slots[slot] = rec
+        return rec
+
+
+def _cancel_run(rec: dict[str, Any]) -> None:
+    run = rec.get("run")
+    rec["run"] = None
+    if run is None:
+        return
+    cancel = getattr(run, "cancel", None)
+    if not callable(cancel):
+        return
+    try:
+        cancel()
+    except Exception:
+        pass
+
+
+def _drop_agent(rec: dict[str, Any]) -> None:
+    _cancel_run(rec)
+    rec["agent"] = None
 
 
 def _message_text(message: dict[str, Any]) -> str:
@@ -198,6 +230,40 @@ def _cursor_image_payload(url: str) -> dict[str, Any] | None:
     if path.is_file():
         return {"path": str(path)}
     return None
+
+
+def _log_cursor_images(images: list[dict[str, Any]] | None) -> None:
+    """Write path/sha of attached images. No file bytes."""
+    import hashlib
+
+    rec: list[dict[str, Any]] = []
+    for image in images or []:
+        if not isinstance(image, dict):
+            continue
+        path = image.get("path")
+        if isinstance(path, str) and Path(path).is_file():
+            raw = Path(path).read_bytes()
+            rec.append(
+                {
+                    "path": path,
+                    "sha256_16": hashlib.sha256(raw).hexdigest()[:16],
+                    "bytes": len(raw),
+                }
+            )
+            continue
+        if image.get("data"):
+            rec.append(
+                {
+                    "kind": "data",
+                    "mime": image.get("mime_type"),
+                    "b64_chars": len(str(image.get("data") or "")),
+                }
+            )
+        elif image.get("url"):
+            rec.append({"kind": "url", "url": str(image["url"])[:120]})
+    Path("/tmp/cursor_images_sent.json").write_text(
+        json.dumps({"n": len(rec), "images": rec}, indent=2)
+    )
 
 
 def window_cursor_messages(
@@ -468,7 +534,7 @@ class CursorSDKClient:
         del timeout, tool_choice
         model_id = model or "grok-4.6"
         slot = self._slot_key(model_id)
-        resume = slot in _agents
+        resume = slot in _slots and _slots[slot].get("agent") is not None
         prompt_text = format_hermes_cursor_prompt(
             messages or [],
             model=model_id,
@@ -481,6 +547,7 @@ class CursorSDKClient:
                 f"chars={len(prompt_text)} tools={len(hermes_tools_spec(tools))} "
                 f"resume={resume} images={len(images)}\n"
             )
+            _log_cursor_images(images)
         except Exception:
             pass
         response_text = self._run_turn(
@@ -570,23 +637,44 @@ class CursorSDKClient:
             return "" if text is None else str(text)
 
         slot = self._slot_key(model)
-        agent = _agents.get(slot) if resume else None
-        if agent is None:
-            agent = Agent.create(options=options)
-            _agents[slot] = agent
-        run = agent.send(_cursor_user_message(prompt_text, images))
-        wait = getattr(run, "wait", None)
-        if callable(wait):
-            wait()
-        text = getattr(run, "text", None)
-        if callable(text):
-            text = text()
-        if isinstance(text, str):
-            return text
-        result = getattr(run, "result", None)
-        if isinstance(result, str):
-            return result
-        return "" if text is None else str(text or "")
+        rec = _slot_record(slot)
+        run = None
+        with rec["lock"]:
+            _cancel_run(rec)
+            if rec.get("agent") is None:
+                rec["agent"] = Agent.create(options=options)
+            try:
+                run = rec["agent"].send(_cursor_user_message(prompt_text, images))
+            except Exception as exc:
+                if "already has active run" not in str(exc).lower():
+                    rec["agent"] = None
+                    raise
+                _drop_agent(rec)
+                rec["agent"] = Agent.create(options=options)
+                run = rec["agent"].send(_cursor_user_message(prompt_text, images))
+            rec["run"] = run
+        try:
+            wait = getattr(run, "wait", None)
+            if callable(wait):
+                wait()
+            text = getattr(run, "text", None)
+            if callable(text):
+                text = text()
+            if isinstance(text, str):
+                return text
+            result = getattr(run, "result", None)
+            if isinstance(result, str):
+                return result
+            return "" if text is None else str(text or "")
+        except Exception:
+            with rec["lock"]:
+                if rec.get("run") is run:
+                    _drop_agent(rec)
+            raise
+        finally:
+            with rec["lock"]:
+                if rec.get("run") is run:
+                    rec["run"] = None
 
 
 def _cursor_user_message(

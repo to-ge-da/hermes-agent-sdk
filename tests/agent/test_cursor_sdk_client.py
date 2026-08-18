@@ -320,3 +320,28 @@ def test_extract_cursor_images_from_namespace_tool_calls(tmp_path):
     ]
     images = extract_cursor_images(messages)
     assert images == [{"path": str(png)}]
+
+
+def test_run_turn_recreates_agent_when_send_already_active():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    run = SimpleNamespace(text="RECOVERED_OK", wait=lambda: None, cancel=lambda: None)
+    created = {"n": 0}
+
+    class _Agent:
+        def send(self, _msg):
+            if created["n"] == 1:
+                raise RuntimeError("internal: Agent agent-x already has active run")
+            return run
+
+    def _create(**_k):
+        created["n"] += 1
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        text = client._run_turn("hi", model="grok-4.5", resume=False)
+    assert text == "RECOVERED_OK"
+    assert created["n"] == 2
