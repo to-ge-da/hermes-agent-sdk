@@ -2211,9 +2211,14 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
+
+    ``TERMINAL_CWD`` is auto-migrated into ``terminal.cwd`` when this is
+    called without an explicit *config* (CLI/gateway startup). After that,
+    the warning is suppressed even if the old .env line remains.
     """
     messaging_cwd = os.environ.get("MESSAGING_CWD")
     terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    loaded_from_disk = config is None
 
     if config is None:
         try:
@@ -2233,11 +2238,15 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"this is deprecated."
         )
     if terminal_cwd_env and not config_has_explicit_cwd:
-        # TERMINAL_CWD in env but not from config bridge — likely from .env
-        lines.append(
-            f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
-            f"this is deprecated."
-        )
+        migrated = False
+        if loaded_from_disk:
+            migrated = _migrate_terminal_cwd_from_env(terminal_cwd_env)
+        if not migrated:
+            # TERMINAL_CWD in env but not from config bridge — likely from .env
+            lines.append(
+                f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
+                f"this is deprecated."
+            )
     if lines:
         from hermes_constants import display_hermes_home
 
@@ -2251,6 +2260,27 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"  \033[2mThen remove the old entries from {hint_path}/.env\033[0m"
         )
         sys.stderr.write("\n".join(lines) + "\n\n")
+
+
+def _migrate_terminal_cwd_from_env(path: str) -> bool:
+    """Copy ``TERMINAL_CWD`` into ``config.yaml`` ``terminal.cwd``. Best-effort."""
+    cwd = (path or "").strip()
+    if not cwd or cwd in {".", "auto", "cwd"}:
+        return False
+    try:
+        raw = read_raw_config()
+        terminal = raw.get("terminal")
+        if not isinstance(terminal, dict):
+            terminal = {}
+            raw["terminal"] = terminal
+        existing = str(terminal.get("cwd") or "").strip()
+        if existing not in {".", "auto", "cwd", ""}:
+            return True
+        terminal["cwd"] = cwd
+        _persist_migration(raw)
+        return True
+    except Exception:
+        return False
 
 
 def _persist_migration(config: Dict[str, Any]) -> None:

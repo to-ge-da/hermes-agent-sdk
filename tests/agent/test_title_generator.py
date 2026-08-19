@@ -145,6 +145,23 @@ class TestGenerateTitle:
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
+    def test_skips_failure_callback_when_no_aux_provider(self):
+        """Cursor-only boxes have no HTTP aux provider — don't scare the user."""
+        captured = []
+
+        def _cb(task, exc):
+            captured.append((task, exc))
+
+        exc = RuntimeError(
+            "No LLM provider configured for task=title_generation provider=auto. "
+            "Run: hermes setup"
+        )
+        with patch("agent.title_generator.call_llm", side_effect=exc):
+            result = generate_title("question", "answer", failure_callback=_cb)
+
+        assert result is None
+        assert captured == []
+
 
 
 

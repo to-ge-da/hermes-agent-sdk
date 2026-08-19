@@ -429,11 +429,17 @@ def generate_title(
             return None
         return title
     except Exception as e:
-        # Log at WARNING so this shows up in agent.log without debug mode.
-        # Full detail at debug level for operators who need the stack.
-        logger.warning("Title generation failed: %s", e)
-        logger.debug("Title generation traceback", exc_info=True)
-        if failure_callback is not None:
+        # Cursor-only boxes have no HTTP aux provider (titles divert to
+        # xai-oauth). Skip quietly — this is not a chat failure.
+        missing_aux = "no llm provider configured" in str(e).lower()
+        if missing_aux:
+            logger.debug("Title generation skipped: no HTTP aux provider (%s)", e)
+        else:
+            # Log at WARNING so this shows up in agent.log without debug mode.
+            # Full detail at debug level for operators who need the stack.
+            logger.warning("Title generation failed: %s", e)
+            logger.debug("Title generation traceback", exc_info=True)
+        if failure_callback is not None and not missing_aux:
             try:
                 failure_callback("title generation", e)
             except Exception:
