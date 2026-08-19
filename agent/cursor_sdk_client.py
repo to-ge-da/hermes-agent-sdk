@@ -67,6 +67,53 @@ def _drop_agent(rec: dict[str, Any]) -> None:
     rec["agent"] = None
 
 
+def _cursor_token_usage(source: Any) -> Any:
+    """Best-effort TokenUsage from a Run, RunResult, or None."""
+    if source is None:
+        return None
+    usage = getattr(source, "usage", None)
+    return usage if usage is not None else None
+
+
+def _openai_usage_from_cursor(token_usage: Any) -> SimpleNamespace:
+    """Map cursor-sdk TokenUsage onto the OpenAI chat-completions usage shape.
+
+    Cursor's ``input_tokens`` excludes cache; OpenAI's ``prompt_tokens``
+    includes it. Hermes ``normalize_usage`` subtracts the details, so we
+    add cache back into ``prompt_tokens``. Missing usage (the #88212 stub)
+    stays zeros.
+    """
+    if token_usage is None:
+        return SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+    input_tokens = int(getattr(token_usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(token_usage, "output_tokens", 0) or 0)
+    cache_read = int(getattr(token_usage, "cache_read_tokens", 0) or 0)
+    cache_write = int(getattr(token_usage, "cache_write_tokens", 0) or 0)
+    total = int(getattr(token_usage, "total_tokens", 0) or 0)
+    reasoning = getattr(token_usage, "reasoning_tokens", None)
+    prompt_tokens = input_tokens + cache_read + cache_write
+    if not total:
+        total = prompt_tokens + output_tokens
+    details = SimpleNamespace(cached_tokens=cache_read, cache_write_tokens=cache_write)
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total,
+        prompt_tokens_details=details,
+        cache_creation_input_tokens=cache_write,
+    )
+    if reasoning:
+        usage.completion_tokens_details = SimpleNamespace(
+            reasoning_tokens=int(reasoning)
+        )
+    return usage
+
+
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
@@ -503,6 +550,7 @@ class CursorSDKClient:
         self._default_headers = dict(default_headers or {})
         self.chat = _CursorChatNamespace(self)
         self.is_closed = False
+        self._last_usage: Any = None
 
     def close(self) -> None:
         self.is_closed = True
@@ -554,12 +602,7 @@ class CursorSDKClient:
             prompt_text, model=model_id, resume=resume, images=images
         )
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = _openai_usage_from_cursor(self._last_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -601,11 +644,17 @@ class CursorSDKClient:
             )
         try:
             from cursor_sdk import Agent
-        except ImportError as exc:
-            raise RuntimeError(
-                "The Cursor provider requires the official cursor-sdk package. "
-                "Install it into the Hermes environment: pip install cursor-sdk"
-            ) from exc
+        except ImportError:
+            try:
+                from tools.lazy_deps import ensure
+
+                ensure("provider.cursor", prompt=False)
+                from cursor_sdk import Agent
+            except Exception as exc:
+                raise RuntimeError(
+                    "The Cursor provider requires the official cursor-sdk package. "
+                    "Install it into the Hermes environment: uv pip install cursor-sdk"
+                ) from exc
 
         cwd = (
             os.environ.get("HERMES_CURSOR_SDK_CWD")
@@ -629,8 +678,10 @@ class CursorSDKClient:
             "tools": [],
         }
 
+        self._last_usage = None
         if oneshot:
             result = Agent.prompt(_cursor_user_message(prompt_text, images), options=options)
+            self._last_usage = _cursor_token_usage(result)
             text = getattr(result, "result", None)
             if isinstance(text, str):
                 return text
@@ -654,9 +705,11 @@ class CursorSDKClient:
                 run = rec["agent"].send(_cursor_user_message(prompt_text, images))
             rec["run"] = run
         try:
+            waited = None
             wait = getattr(run, "wait", None)
             if callable(wait):
-                wait()
+                waited = wait()
+            self._last_usage = _cursor_token_usage(waited) or _cursor_token_usage(run)
             text = getattr(run, "text", None)
             if callable(text):
                 text = text()
@@ -665,6 +718,9 @@ class CursorSDKClient:
             result = getattr(run, "result", None)
             if isinstance(result, str):
                 return result
+            waited_text = getattr(waited, "result", None) if waited is not None else None
+            if isinstance(waited_text, str):
+                return waited_text
             return "" if text is None else str(text or "")
         except Exception:
             with rec["lock"]:

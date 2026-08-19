@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from agent.cursor_sdk_client import (
     CursorSDKClient,
+    _openai_usage_from_cursor,
     cursor_sdk_model,
     extract_cursor_images,
     expand_cursor_model_ids,
@@ -345,3 +346,82 @@ def test_run_turn_recreates_agent_when_send_already_active():
         text = client._run_turn("hi", model="grok-4.5", resume=False)
     assert text == "RECOVERED_OK"
     assert created["n"] == 2
+
+
+def test_openai_usage_from_cursor_none_is_zeros():
+    usage = _openai_usage_from_cursor(None)
+    assert usage.prompt_tokens == 0
+    assert usage.completion_tokens == 0
+    assert usage.total_tokens == 0
+    assert usage.prompt_tokens_details.cached_tokens == 0
+
+
+def test_openai_usage_from_cursor_adds_cache_into_prompt_tokens():
+    # Cursor input excludes cache; OpenAI prompt_tokens includes it.
+    usage = _openai_usage_from_cursor(
+        SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=40,
+            cache_write_tokens=10,
+            total_tokens=170,
+            reasoning_tokens=8,
+        )
+    )
+    assert usage.prompt_tokens == 150
+    assert usage.completion_tokens == 20
+    assert usage.total_tokens == 170
+    assert usage.prompt_tokens_details.cached_tokens == 40
+    assert usage.prompt_tokens_details.cache_write_tokens == 10
+    assert usage.completion_tokens_details.reasoning_tokens == 8
+
+
+def test_create_surfaces_cursor_run_usage():
+    client = CursorSDKClient(api_key="crsr_test")
+
+    def _run(*_a, **_k):
+        client._last_usage = SimpleNamespace(
+            input_tokens=80,
+            output_tokens=12,
+            cache_read_tokens=20,
+            cache_write_tokens=0,
+            total_tokens=112,
+        )
+        return "NATIVE_CURSOR_OK"
+
+    with patch.object(client, "_run_turn", side_effect=_run):
+        done = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    assert done.choices[0].message.content == "NATIVE_CURSOR_OK"
+    assert done.usage.prompt_tokens == 100
+    assert done.usage.completion_tokens == 12
+    assert done.usage.total_tokens == 112
+    assert done.usage.prompt_tokens_details.cached_tokens == 20
+
+
+def test_run_turn_reads_usage_from_wait_result():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    cursor_usage = SimpleNamespace(
+        input_tokens=42,
+        output_tokens=7,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        total_tokens=49,
+    )
+    waited = SimpleNamespace(result="USAGE_OK", usage=cursor_usage)
+    run = SimpleNamespace(text="USAGE_OK", wait=lambda: waited, cancel=lambda: None)
+
+    class _Agent:
+        def send(self, _msg):
+            return run
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        text = client._run_turn("hi", model="grok-4.6", resume=False)
+    assert text == "USAGE_OK"
+    assert client._last_usage is cursor_usage

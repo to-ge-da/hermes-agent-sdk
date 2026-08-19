@@ -113,6 +113,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
     # users never pay this import.
     "provider.azure_identity": ("azure-identity==1.25.3",),
+    # Cursor provider — official cursor-sdk (proprietary license, public
+    # beta). The wheel is ~48 MB because it bundles the `cursor-sdk-bridge`
+    # binary, so it must stay lazy-only: never add it to the base
+    # dependencies or the [all] extra. Install: uv pip install cursor-sdk
+    "provider.cursor": ("cursor-sdk==0.1.9",),
 
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),

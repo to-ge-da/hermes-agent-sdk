@@ -18,7 +18,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenAI Codex** | `hermes model` → **ChatGPT or Codex Subscription** (ChatGPT OAuth, uses Codex models) |
 | **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
-| **Cursor** | `CURSOR_API_KEY` in `~/.hermes/.env` (provider: `cursor`; aliases: `cursor-sdk`, `cursor-composer`). Requires `pip install cursor-sdk`. Dashboard key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api). Hermes stays the harness; there is no official Cursor chat-completions API. |
+| **Cursor** | `CURSOR_API_KEY` in `~/.hermes/.env` (provider: `cursor`; aliases: `cursor-sdk`, `cursor-composer`). Requires `uv pip install cursor-sdk` (lazy-only; not in `[all]`). Dashboard key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api). Hermes stays the harness; there is no official Cursor chat-completions API. |
 | **Anthropic** | `hermes model` (Claude Max + extra usage credits via OAuth; also supports Anthropic API key or manual setup-token — see note below) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
