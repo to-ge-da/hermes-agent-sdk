@@ -1006,12 +1006,102 @@ _deferred_agent_startup_done = False
 # one-shot CLI runs — which also register _run_cleanup via atexit — don't emit
 # escape codes for modes they never enabled (#36823).
 _tui_input_modes_active = False
+# Pre-TUI cooked termios snapshot. ``_heal_cooked_mode_drift`` strips ECHO
+# while the TUI is alive; if that healer races past prompt_toolkit's unwind
+# (long sessions, /exit after idle), the parent shell is left with echo off.
+_orig_tty_attrs = None
+_orig_tty_fd: int | None = None
+_tty_restore_atexit_registered = False
+_tui_exiting = False
+
+
+def _tty_fd() -> int | None:
+    """Controlling tty fd, or None when stdin/stdout/stderr are not ttys."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            fd = stream.fileno()
+            if os.isatty(fd):
+                return fd
+        except Exception:
+            continue
+    return None
+
+
+def _capture_tty_attrs(fd: int | None = None) -> None:
+    """Snapshot cooked tty attrs before prompt_toolkit takes raw mode.
+
+    Idempotent: keep the first snapshot so later healer/run_in_terminal
+    mutations never become the attrs we restore on /exit.
+    """
+    global _orig_tty_attrs, _orig_tty_fd, _tty_restore_atexit_registered
+    if os.name == "nt":
+        return
+    if _orig_tty_attrs is None:
+        try:
+            import termios
+            snap_fd = fd if fd is not None else _tty_fd()
+            if snap_fd is not None:
+                _orig_tty_attrs = copy.deepcopy(termios.tcgetattr(snap_fd))
+                _orig_tty_fd = snap_fd
+        except Exception:
+            pass
+    if not _tty_restore_atexit_registered:
+        # Tests invoke capture on throwaway ptys; do not atexit-restore those
+        # attrs onto the real stdin of the pytest worker.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            _tty_restore_atexit_registered = True
+        else:
+            try:
+                atexit.register(_restore_cooked_tty)
+                _tty_restore_atexit_registered = True
+            except Exception:
+                pass
+
+
+def _mark_tui_exiting() -> None:
+    """Stop cooked→raw healing: the TUI no longer owns the tty."""
+    global _tui_exiting
+    _tui_exiting = True
+
+
+def _restore_cooked_tty(fd: int | None = None) -> None:
+    """Force the controlling tty back to cooked+echo. Idempotent. POSIX.
+
+    Called from TUI cleanup, after the exit summary, and via atexit so a
+    daemon healer cannot leave ``stty -echo`` behind for the parent shell.
+    """
+    if os.name == "nt":
+        return
+    try:
+        import termios
+    except Exception:
+        return
+    restore_fd = fd if fd is not None else _tty_fd()
+    if restore_fd is None:
+        return
+    try:
+        if _orig_tty_attrs is not None:
+            termios.tcsetattr(restore_fd, termios.TCSAFLUSH, _orig_tty_attrs)
+            return
+        attrs = termios.tcgetattr(restore_fd)
+        lflag = attrs[3]
+        if (lflag & termios.ECHO) and (lflag & termios.ICANON):
+            return
+        attrs[3] = lflag | termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN
+        attrs[1] |= termios.OPOST
+        attrs[0] |= termios.ICRNL
+        attrs[6][termios.VMIN] = 1
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(restore_fd, termios.TCSAFLUSH, attrs)
+    except Exception:
+        pass
 
 
 def _mark_tui_input_modes_active() -> None:
     """Record that the TUI app started, so _run_cleanup resets input modes."""
     global _tui_input_modes_active
     _tui_input_modes_active = True
+    _capture_tty_attrs()
 
 
 def _prepare_deferred_agent_startup() -> None:
@@ -1474,7 +1564,11 @@ def _reset_terminal_input_modes_on_exit() -> None:
     stdout is redirected away from the terminal.
     """
     global _tui_input_modes_active
+    _mark_tui_exiting()
     if not _tui_input_modes_active:
+        # Non-TUI / already-reset path: still force cooked+echo so a healer
+        # that raced past prompt_toolkit cannot leak ``stty -echo``.
+        _restore_cooked_tty()
         return
     # About to disable the modes — clear the flag so a re-armed _run_cleanup (or
     # a long-lived process that reuses it) doesn't re-emit them.
@@ -1486,6 +1580,7 @@ def _reset_terminal_input_modes_on_exit() -> None:
         if stream is not None and stream.isatty():
             stream.write(_TERMINAL_INPUT_MODE_RESET_SEQ)
             stream.flush()
+            _restore_cooked_tty()
             return
     except Exception:
         pass
@@ -1495,6 +1590,7 @@ def _reset_terminal_input_modes_on_exit() -> None:
             tty.flush()
     except Exception:
         pass
+    _restore_cooked_tty()
 
 
 # =============================================================================
@@ -8826,10 +8922,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         requiring an external ``stty`` rescue.  Skipped while a
         ``run_in_terminal`` window is legitimately holding cooked mode
         (``app._running_in_terminal``), while the agent is running (approval
-        prompts and sudo prompts legitimately manipulate the tty), and on
-        Windows (no termios).
+        prompts and sudo prompts legitimately manipulate the tty), on
+        Windows (no termios), and once ``_should_exit`` / ``_tui_exiting``
+        so a post-``/exit`` heal cannot strip ECHO from the parent shell.
         """
         if os.name == "nt":
+            return
+        # /exit and signal unwind restore cooked mode. Healing after that
+        # would strip ECHO again and leave the parent shell mute.
+        if (
+            getattr(self, "_should_exit", False)
+            or _tui_exiting
+            or _cleanup_done
+            or _cleanup_in_progress
+        ):
             return
         app = getattr(self, "_app", None)
         if app is None or not getattr(app, "_is_running", False):
@@ -19405,6 +19511,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # minutes (#65998 class).  Never raises.
             _arm_exit_watchdog_on_shutdown_signal()
             try:
+                self._should_exit = True
+            except Exception:
+                pass
+            _mark_tui_exiting()
+            try:
                 _signal_agent = getattr(self, "agent", None)
                 if _signal_agent is not None and getattr(self, "_agent_running", False):
                     request_hard_interrupt(
@@ -19680,6 +19791,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _run_cleanup()
             self._print_exit_summary()
             self._release_active_session()
+            # Last: force cooked+echo after summary prints. Cleanup restores
+            # early so a hung flush does not trap the user, but a daemon
+            # healer can race during that window — stamp cooked again here.
+            _restore_cooked_tty()
 
         # Deferred relaunch: /update sets _pending_relaunch so the exec
         # happens here — after prompt_toolkit has exited and fully restored
