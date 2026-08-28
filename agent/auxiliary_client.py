@@ -5848,12 +5848,32 @@ def _resolve_auto_route(
     # Cursor Agent SDK is not an OpenAI chat endpoint. Same-model policy for
     # auxiliary tasks (compression, titles, …) means the same Grok slug on
     # xAI's HTTP API, not OpenRouter and not cursor-sdk://.
+    #
+    # Only Grok slugs travel: Cursor also serves Claude, Composer, GPT and
+    # Gemini SKUs, and handing xAI a ``claude-opus-5`` model id 404s every
+    # compression/title/vision call for the whole session. Those fall through
+    # to normal auto-detection, which picks whatever HTTP provider the user
+    # actually has (and degrades gracefully when they have none).
     if main_provider in {"cursor", "cursor-sdk", "cursor-composer"}:
-        _cursor_model = main_model or "grok-4.6"
-        if _cursor_model.startswith("cursor-"):
-            _cursor_model = _cursor_model[len("cursor-"):]
-        main_provider = "xai-oauth"
-        main_model = _cursor_model or "grok-4.6"
+        try:
+            from agent.cursor_sdk_client import normalize_cursor_model_id
+
+            _cursor_model = normalize_cursor_model_id(main_model or "grok-4.6")
+        except Exception:
+            _cursor_model = main_model or "grok-4.6"
+            if _cursor_model.startswith("cursor-"):
+                _cursor_model = _cursor_model[len("cursor-"):]
+        if _cursor_model.startswith("grok"):
+            main_provider = "xai-oauth"
+            main_model = _cursor_model
+        else:
+            logger.debug(
+                "Auxiliary task %s: cursor model %s has no xAI HTTP twin — "
+                "resolving an auxiliary provider by auto-detection",
+                task, main_model,
+            )
+            main_provider = ""
+            main_model = ""
         runtime_base_url = ""
         runtime_api_key = ""
         runtime_api_mode = ""

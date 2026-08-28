@@ -148,6 +148,64 @@ class TestResolveAutoMainFirst:
 
 
 
+    def test_cursor_grok_main_resolves_aux_to_the_xai_http_twin(self):
+        """Cursor has no chat-completions API; Grok slugs have an xAI twin."""
+        mock_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "grok-4.6"),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            _resolve_auto(
+                main_runtime={
+                    "provider": "cursor",
+                    "model": "cursor-grok-4.6-high-fast",
+                    "base_url": "cursor-sdk://local",
+                    "api_key": "crsr_test",
+                },
+                task="title_generation",
+            )
+
+        assert mock_resolve.call_args.args[:2] == ("xai-oauth", "grok-4.6")
+
+    def test_cursor_non_grok_main_never_asks_xai_for_that_model(self):
+        """A Cursor Claude/Composer SKU must not be sent to xAI's HTTP API.
+
+        ``xai-oauth`` + ``claude-opus-5`` 404s every compression, title and
+        vision call for the whole session; auto-detection has to pick a real
+        HTTP provider (or cleanly report none) instead.
+        """
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(None, None, None),
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            try:
+                _resolve_auto(
+                    main_runtime={
+                        "provider": "cursor",
+                        "model": "cursor-claude-opus-5-high",
+                        "base_url": "cursor-sdk://local",
+                        "api_key": "crsr_test",
+                    },
+                    task="title_generation",
+                )
+            except RuntimeError:
+                pass  # "no provider configured" is an acceptable outcome here
+
+        routed = [call.args[:2] for call in mock_resolve.call_args_list]
+        assert not any(provider == "xai-oauth" for provider, _model in routed)
+        assert not any("claude" in str(model or "") for _p, model in routed if _p == "xai-oauth")
+
     def test_main_unavailable_uses_task_fallback_chain_before_builtin_chain(self):
         """Auto aux resolution honors auxiliary.<task>.fallback_chain before built-ins."""
         task_client = MagicMock()
