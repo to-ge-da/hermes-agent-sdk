@@ -10,14 +10,23 @@ import pytest
 
 from agent.cursor_sdk_client import (
     CursorSDKClient,
+    CursorSDKError,
     _cursor_sdk_slot_flavor,
     _openai_usage_from_cursor,
+    cursor_aux_http_twin,
+    cursor_image_key,
+    cursor_sdk_error,
     cursor_sdk_model,
     extract_cursor_images,
     expand_cursor_model_ids,
     format_hermes_cursor_prompt,
     hermes_tools_spec,
+    history_was_rewritten,
+    is_grok_cursor_model,
     normalize_cursor_model_id,
+    split_cursor_model_id,
+    transcript_anchor,
+    turn_delta_messages,
     window_cursor_messages,
 )
 
@@ -435,6 +444,380 @@ def test_create_surfaces_cursor_run_usage():
     assert done.usage.prompt_tokens_details.cached_tokens == 20
 
 
+def _fake_cursor_sdk(sent: list, *, created: dict, text: str = "NATIVE_CURSOR_OK"):
+    """cursor_sdk stand-in that records every send and Agent.create."""
+    run = SimpleNamespace(text=text, wait=lambda: None, cancel=lambda: None)
+
+    class _Agent:
+        def send(self, msg):
+            sent.append(msg)
+            return run
+
+    def _create(**_k):
+        created["n"] = created.get("n", 0) + 1
+        return _Agent()
+
+    return SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+
+
+def test_transcript_anchor_tracks_count_and_head():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    count, head = transcript_anchor(messages)
+    assert count == 3
+    assert head == transcript_anchor([{"role": "user", "content": "first"}])[1]
+
+
+def test_history_was_rewritten_only_on_shrink_or_new_head():
+    grown = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "next"},
+    ]
+    previous = transcript_anchor(grown[:3])
+    assert history_was_rewritten(previous, transcript_anchor(grown)) is False
+    # Compression: middle turns dropped, a summary takes the head slot.
+    compressed = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "[SUMMARY] earlier turns"},
+        {"role": "user", "content": "next"},
+    ]
+    assert history_was_rewritten(previous, transcript_anchor(compressed)) is True
+    assert history_was_rewritten(None, transcript_anchor(grown)) is False
+
+
+def test_compressed_transcript_starts_a_fresh_cursor_agent():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    sent: list = []
+    created: dict = {}
+    history = [{"role": "system", "content": "sys"}]
+    history += [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    history += [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    history += [{"role": "user", "content": "q3"}]
+
+    with patch.dict(
+        "sys.modules", {"cursor_sdk": SimpleNamespace(Agent=_fake_cursor_sdk(sent, created=created))}
+    ):
+        client.chat.completions.create(model="grok-4.6", messages=history)
+        client.chat.completions.create(
+            model="grok-4.6",
+            messages=history + [{"role": "assistant", "content": "a3"}, {"role": "user", "content": "q4"}],
+        )
+        # Compression rewrote the transcript: fewer messages, summary head.
+        client.chat.completions.create(
+            model="grok-4.6",
+            messages=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "[SUMMARY] q1..q3"},
+                {"role": "user", "content": "q4"},
+            ],
+        )
+
+    assert len(sent) == 3
+    assert "Conversation:" in sent[0]  # cold start seeds the window
+    assert "New turn:" in sent[1]  # live agent gets a delta
+    assert "Conversation:" in sent[2]  # rewrite → cold start again
+    assert created["n"] == 2
+
+
+def test_turn_delta_scopes_images_to_the_current_turn():
+    older = {
+        "role": "tool",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,old"}}
+        ],
+    }
+    messages = [
+        {"role": "user", "content": "look at this"},
+        older,
+        {"role": "assistant", "content": "seen"},
+        {"role": "user", "content": "unrelated follow-up"},
+    ]
+    assert extract_cursor_images(messages) == [{"data": "old", "mime_type": "image/png"}]
+    assert extract_cursor_images(turn_delta_messages(messages)) == []
+
+
+def test_images_are_uploaded_once_per_agent():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    sent: list = []
+    created: dict = {}
+    messages = [
+        {"role": "user", "content": "read the screenshot"},
+        {
+            "role": "tool",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,shot"}}
+            ],
+        },
+    ]
+    with patch.dict(
+        "sys.modules", {"cursor_sdk": SimpleNamespace(Agent=_fake_cursor_sdk(sent, created=created))}
+    ):
+        client.chat.completions.create(model="grok-4.6", messages=messages)
+        client.chat.completions.create(
+            model="grok-4.6",
+            messages=messages + [{"role": "assistant", "content": "ok"}, {"role": "tool", "content": "done"}],
+        )
+
+    assert isinstance(sent[0], dict) and sent[0]["images"] == [
+        {"data": "shot", "mime_type": "image/png"}
+    ]
+    assert isinstance(sent[1], str)  # same image, no second upload
+
+
+def test_cursor_image_key_follows_file_mutations(tmp_path):
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+    first = cursor_image_key({"path": str(shot)})
+    shot.write_bytes(b"\x89PNG\r\n\x1a\nDIFFERENT")
+    assert cursor_image_key({"path": str(shot)}) != first
+    assert cursor_image_key({"url": "https://x/y.png"}) == "url:https://x/y.png"
+
+
+def test_slot_key_isolates_sessions_and_shares_sku_aliases():
+    import os
+
+    client = CursorSDKClient(api_key="crsr_test")
+    with patch.dict(os.environ, {"HERMES_SESSION_ID": "sess-a"}):
+        a_catalog = client._slot_key("cursor-grok-4.6-high-fast")
+        a_alias = client._slot_key("grok-4.6")
+        a_low = client._slot_key("cursor-grok-4.6-low-fast")
+    with patch.dict(os.environ, {"HERMES_SESSION_ID": "sess-b"}):
+        b_alias = client._slot_key("grok-4.6")
+    # Honor-both-params (#2): catalog high-fast is not the same SKU as bare
+    # grok-4.6 (high / not-fast). Aliases of the *same* params still share.
+    assert a_catalog != a_alias
+    assert a_low != a_alias  # different reasoning tier → its own agent
+    assert a_alias != b_alias  # sessions never share an agent
+    with patch.dict(os.environ, {"HERMES_SESSION_ID": "sess-a"}):
+        assert client._slot_key("grok-4.6") == client._slot_key("cursor-grok-4.6-high")
+
+
+def test_slot_key_prefers_the_session_contextvar():
+    import os
+
+    from gateway.session_context import _SESSION_ID
+
+    client = CursorSDKClient(api_key="crsr_test")
+    token = _SESSION_ID.set("ctx-session")
+    try:
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "env-session"}):
+            key = client._slot_key("grok-4.6")
+    finally:
+        _SESSION_ID.reset(token)
+    assert "ctx-session" in key
+    assert "env-session" not in key
+
+
+def test_split_cursor_model_id_strips_tier_and_fast_together():
+    assert split_cursor_model_id("cursor-grok-4.6-high-fast") == ("grok-4.6", "high", True)
+    assert split_cursor_model_id("cursor-grok-4.6-low-fast") == ("grok-4.6", "low", True)
+    assert split_cursor_model_id("cursor-grok-4.6-medium-fast") == ("grok-4.6", "medium", True)
+    assert split_cursor_model_id("grok-4.6-low") == ("grok-4.6", "low", False)
+    assert split_cursor_model_id("composer-2.5") == ("composer-2.5", "", False)
+    # Every parse must yield an id the SDK accepts — never a tier-suffixed one.
+    for raw in ("cursor-grok-4.6-medium-fast", "grok-4.6-low", "cursor-grok-4.6-high"):
+        assert normalize_cursor_model_id(raw) == "grok-4.6"
+
+
+def test_cursor_aux_http_twin_only_maps_grok_skus():
+    assert cursor_aux_http_twin("cursor-grok-4.6-high-fast") == ("xai-oauth", "grok-4.6")
+    assert cursor_aux_http_twin("grok-4.6") == ("xai-oauth", "grok-4.6")
+    assert cursor_aux_http_twin("cursor-claude-opus-5-high") is None
+    assert cursor_aux_http_twin("composer-2.5") is None
+    assert cursor_aux_http_twin("gpt-5.5") is None
+    assert is_grok_cursor_model("cursor-grok-4.6-low-fast") is True
+    assert is_grok_cursor_model("claude-opus-5") is False
+
+
+def test_cursor_sdk_model_honors_catalog_reasoning_tier():
+    low = cursor_sdk_model("cursor-grok-4.6-low-fast")
+    assert low["id"] == "grok-4.6"
+    assert {p["id"]: p["value"] for p in low["params"]}["reasoning"] == "low"
+    # Bare ids keep the deliberate high-not-fast default.
+    assert {p["id"]: p["value"] for p in cursor_sdk_model("grok-4.6")["params"]} == {
+        "fast": "false",
+        "reasoning": "high",
+    }
+
+
+def test_cursor_sdk_error_classifies_auth_and_quota():
+    auth = cursor_sdk_error(RuntimeError("401 Unauthorized: invalid api key"), phase="send")
+    assert auth.status_code == 401
+    assert "CURSOR_API_KEY" in str(auth)
+    quota = cursor_sdk_error(RuntimeError('{"error":"rate limit exceeded"}'), phase="run")
+    assert quota.status_code == 429
+    assert "usage limit" in str(quota).lower()
+    unknown = cursor_sdk_error(RuntimeError("bridge exited"), phase="send")
+    assert unknown.status_code == 502
+
+
+def test_cursor_sdk_error_uses_profile_aware_home():
+    with patch(
+        "agent.cursor_sdk_client.display_hermes_home",
+        return_value="~/.hermes/profiles/coder",
+    ):
+        auth = cursor_sdk_error(
+            RuntimeError("401 Unauthorized: invalid api key"), phase="send"
+        )
+        try:
+            CursorSDKClient(api_key="")._run_prompt("hi", model="grok-4.6")
+            raise AssertionError("expected missing-key error")
+        except CursorSDKError as exc:
+            assert "~/.hermes/profiles/coder/.env" in str(exc)
+    assert "~/.hermes/profiles/coder/.env" in str(auth)
+
+
+def test_missing_key_error_is_classified_as_auth():
+    client = CursorSDKClient(api_key="")
+    try:
+        client._run_prompt("hi", model="grok-4.6")
+        raise AssertionError("expected missing-key error")
+    except CursorSDKError as exc:
+        assert exc.status_code == 401
+
+
+def test_empty_cursor_response_raises_and_drops_the_agent():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    sent: list = []
+    created: dict = {}
+    fake = _fake_cursor_sdk(sent, created=created, text="   ")
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        try:
+            client.chat.completions.create(
+                model="grok-4.6", messages=[{"role": "user", "content": "ping"}]
+            )
+            raise AssertionError("expected an empty-response error")
+        except CursorSDKError as exc:
+            assert exc.status_code == 502
+    assert all(rec.get("agent") is None for rec in mod._slots.values())
+
+
+def test_busy_agent_on_a_resume_turn_reseeds_the_full_window():
+    """A replacement agent must never be handed an orphaned delta prompt."""
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    sent: list = []
+    created: dict = {}
+    run = SimpleNamespace(text="OK", wait=lambda: None, cancel=lambda: None)
+
+    class _Agent:
+        """Accepts one send, then reports its run as still active."""
+
+        def __init__(self):
+            self.sends = 0
+
+        def send(self, msg):
+            self.sends += 1
+            if self.sends > 1:
+                raise RuntimeError("internal: Agent agent-x already has active run")
+            sent.append(msg)
+            return run
+
+    def _create(**_k):
+        created["n"] = created.get("n", 0) + 1
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "remember apples"},
+        {"role": "assistant", "content": "noted"},
+    ]
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        client.chat.completions.create(model="grok-4.6", messages=history)
+        client.chat.completions.create(
+            model="grok-4.6",
+            messages=history + [{"role": "user", "content": "what fruit?"}],
+        )
+
+    assert created["n"] == 2  # the busy agent is replaced, not reused
+    assert len(sent) == 2
+    assert "remember apples" in sent[1]  # the reseed carries the history
+    assert "Conversation:" in sent[1]
+
+
+def test_interrupt_keeps_the_live_agent_for_the_next_turn():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    cancelled: list = []
+
+    def _wait():
+        raise KeyboardInterrupt
+
+    run = SimpleNamespace(
+        text="", wait=_wait, cancel=lambda: cancelled.append(True)
+    )
+
+    class _Agent:
+        def send(self, _msg):
+            return run
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        try:
+            client.chat.completions.create(
+                model="grok-4.6", messages=[{"role": "user", "content": "long task"}]
+            )
+            raise AssertionError("expected the interrupt to propagate")
+        except KeyboardInterrupt:
+            pass
+
+    assert cancelled  # the orphaned run is cancelled, not left open
+    assert any(rec.get("agent") is not None for rec in mod._slots.values())
+    mod._slots.clear()
+
+
+def test_idle_slots_over_the_cap_are_evicted_and_closed():
+    import time as _time
+
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    closed: list = []
+    stale = _time.monotonic() - mod._SLOT_IDLE_SECONDS - 60
+    for i in range(mod._MAX_LIVE_SLOTS + 1):
+        rec = mod._slot_record(f"slot-{i}")
+        rec["agent"] = SimpleNamespace(close=lambda i=i: closed.append(i))
+        rec["used"] = stale + i
+    mod._evict_idle_slots(f"slot-{mod._MAX_LIVE_SLOTS}")
+    live = [k for k, rec in mod._slots.items() if rec.get("agent") is not None]
+    assert len(live) <= mod._MAX_LIVE_SLOTS
+    assert closed == [0]  # the bridge is torn down, not just dereferenced
+    mod._slots.clear()
+
+
+def test_busy_multi_chat_slots_are_not_evicted():
+    """A gateway juggling several live chats must not pay repeated cold starts."""
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    closed: list = []
+    for i in range(mod._MAX_LIVE_SLOTS + 2):
+        rec = mod._slot_record(f"chat-{i}")
+        rec["agent"] = SimpleNamespace(close=lambda i=i: closed.append(i))
+    mod._evict_idle_slots("chat-0")
+    assert closed == []
+    mod._slots.clear()
+
+
 def test_run_turn_reads_usage_from_wait_result():
     from agent import cursor_sdk_client as mod
 
@@ -485,7 +868,8 @@ def test_run_turn_cancels_and_closes_on_keyboard_interrupt():
         with pytest.raises(KeyboardInterrupt):
             client._run_turn("hi", model="grok-4.6", resume=False)
     assert state["cancelled"] is True
-    assert state["closed"] is True
+    # Keep the agent so the next turn is not an amnesia cold-start (#5).
+    assert state["closed"] is False
 
 
 def test_run_turn_raises_on_error_status_instead_of_empty_text():
