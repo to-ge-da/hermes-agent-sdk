@@ -529,7 +529,6 @@ _CURSOR_VARIANT_SUFFIXES = ("-high-fast", "-low-fast", "-high", "-low", "-fast")
 
 # Nous #88212 pin: suffix-less grok-* is high / not-fast (reasoning tokens).
 _GROK_DEFAULT_REASONING = "high"
-_GROK_DEFAULT_FAST = "false"
 
 
 def _cursor_catalog_bare(model_id: str) -> str:
