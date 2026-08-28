@@ -172,6 +172,10 @@ class ProviderProfile:
 
         Used by providers that are not HTTP chat-completions (ACP, Agent SDK
         shims). Default None keeps the standard OpenAI() construction path.
+
+        ``kwargs`` carries the usual client kwargs plus ``session_id`` — the
+        owning agent's session id, for profiles that hold per-conversation
+        state (accept and ignore it when stateless).
         """
         return None
 

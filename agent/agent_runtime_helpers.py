@@ -2490,7 +2490,12 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     except Exception:
         profile = None
     if profile is not None:
-        custom = profile.build_openai_client(**client_kwargs)
+        build_kwargs = dict(client_kwargs)
+        build_kwargs.pop("session_id", None)
+        # Profiles holding per-conversation state (cursor-sdk Agent slots)
+        # key it by the owning session, not the process-global env.
+        build_kwargs["session_id"] = getattr(agent, "session_id", None)
+        custom = profile.build_openai_client(**build_kwargs)
         if custom is not None:
             _ra().logger.info(
                 "%s client created (%s, shared=%s) %s",
