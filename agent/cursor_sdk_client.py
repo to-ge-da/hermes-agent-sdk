@@ -17,6 +17,7 @@ trailing tool results. Do not flatten a 300k resume into Agent.prompt.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -24,6 +25,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.copilot_acp_client import _extract_tool_calls_from_text
+
+log = logging.getLogger(__name__)
 
 CURSOR_MARKER_BASE_URL = "cursor-sdk://local"
 
@@ -62,9 +65,94 @@ def _cancel_run(rec: dict[str, Any]) -> None:
         pass
 
 
+def _close_agent(agent: Any) -> None:
+    """Dispose the SDK agent — it owns a cursor-sdk-bridge child process."""
+    if agent is None:
+        return
+    close = getattr(agent, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        pass
+
+
 def _drop_agent(rec: dict[str, Any]) -> None:
     _cancel_run(rec)
+    agent = rec.get("agent")
     rec["agent"] = None
+    _close_agent(agent)
+
+
+_RUN_FAILURE_STATUSES = frozenset({"error", "failed", "cancelled", "canceled"})
+
+
+def _run_status(*sources: Any) -> str:
+    for source in sources:
+        status = getattr(source, "status", None)
+        if isinstance(status, str) and status.strip():
+            return status.strip().lower()
+    return ""
+
+
+def _run_failure_detail(*sources: Any) -> str:
+    for source in sources:
+        if source is None:
+            continue
+        for attr in ("error", "message", "detail"):
+            value = getattr(source, attr, None)
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else str(value)
+            text = text.strip()
+            if text and text != "None":
+                return text
+    return ""
+
+
+def _raise_for_failed_run(*sources: Any) -> None:
+    """A thrown exception means the run never started; ``status == "error"``
+    means it ran and failed. Returning that as empty assistant text would
+    trigger the Hermes empty-response retry storm on a dead run."""
+    status = _run_status(*sources)
+    if status not in _RUN_FAILURE_STATUSES:
+        return
+    detail = _run_failure_detail(*sources)
+    suffix = f": {detail}" if detail else " (cursor-sdk returned no error detail)"
+    raise RuntimeError(f"Cursor run ended with status '{status}'{suffix}")
+
+
+_CURSOR_AUTH_HINTS = (
+    "401",
+    "unauthorized",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "forbidden",
+    "token expired",
+    "access denied",
+)
+
+
+def _cursor_startup_error(exc: Exception, *, phase: str) -> RuntimeError:
+    """Map cursor-sdk startup failures onto actionable Hermes errors.
+
+    The original SDK text stays in the message so the Hermes error
+    classifier (message-matched auth patterns) still routes 401s to the
+    auth/failover path.
+    """
+    text = str(exc).strip() or exc.__class__.__name__
+    if any(hint in text.lower() for hint in _CURSOR_AUTH_HINTS):
+        from hermes_constants import display_hermes_home
+
+        return RuntimeError(
+            "Cursor rejected the API key (authentication failed). Check "
+            f"CURSOR_API_KEY in {display_hermes_home()}/.env or regenerate it at "
+            "https://cursor.com/dashboard/api. "
+            f"cursor-sdk said: {text}"
+        )
+    return RuntimeError(f"Cursor Agent SDK {phase} failed: {text}")
 
 
 def _cursor_token_usage(source: Any) -> Any:
@@ -279,40 +367,6 @@ def _cursor_image_payload(url: str) -> dict[str, Any] | None:
     return None
 
 
-def _log_cursor_images(images: list[dict[str, Any]] | None) -> None:
-    """Write path/sha of attached images. No file bytes."""
-    import hashlib
-
-    rec: list[dict[str, Any]] = []
-    for image in images or []:
-        if not isinstance(image, dict):
-            continue
-        path = image.get("path")
-        if isinstance(path, str) and Path(path).is_file():
-            raw = Path(path).read_bytes()
-            rec.append(
-                {
-                    "path": path,
-                    "sha256_16": hashlib.sha256(raw).hexdigest()[:16],
-                    "bytes": len(raw),
-                }
-            )
-            continue
-        if image.get("data"):
-            rec.append(
-                {
-                    "kind": "data",
-                    "mime": image.get("mime_type"),
-                    "b64_chars": len(str(image.get("data") or "")),
-                }
-            )
-        elif image.get("url"):
-            rec.append({"kind": "url", "url": str(image["url"])[:120]})
-    Path("/tmp/cursor_images_sent.json").write_text(
-        json.dumps({"n": len(rec), "images": rec}, indent=2)
-    )
-
-
 def window_cursor_messages(
     messages: list[dict[str, Any]],
     *,
@@ -470,14 +524,8 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-# Longest first. Catalog ids like cursor-grok-4.6-high-fast map to SDK params;
-# Agent.prompt still receives the stripped id (it rejects the catalog string).
-_CURSOR_SDK_PARAM_SUFFIXES: tuple[tuple[str, str, str], ...] = (
-    ("-high-fast", "high", "true"),
-    ("-low-fast", "low", "true"),
-    ("-high", "high", "false"),
-    ("-fast", "high", "true"),
-)
+# Catalog SKU suffixes, longest first so "-low-fast" wins over "-fast".
+_CURSOR_VARIANT_SUFFIXES = ("-high-fast", "-low-fast", "-high", "-low", "-fast")
 
 # Nous #88212 pin: suffix-less grok-* is high / not-fast (reasoning tokens).
 _GROK_DEFAULT_REASONING = "high"
@@ -491,13 +539,13 @@ def _cursor_catalog_bare(model_id: str) -> str:
     return raw
 
 
-def _cursor_sdk_params_from_catalog(model_id: str) -> tuple[str, str]:
-    """Return ``(reasoning, fast)`` from suffixes on the raw catalog id."""
-    lower = _cursor_catalog_bare(model_id).lower()
-    for suffix, reasoning, fast in _CURSOR_SDK_PARAM_SUFFIXES:
-        if lower.endswith(suffix):
-            return reasoning, fast
-    return _GROK_DEFAULT_REASONING, _GROK_DEFAULT_FAST
+def _cursor_variant(model_id: str) -> str:
+    """SKU suffix of a catalog id ("" when bare/unknown)."""
+    lowered = (model_id or "").strip().lower()
+    for suffix in _CURSOR_VARIANT_SUFFIXES:
+        if lowered.endswith(suffix):
+            return suffix[1:]
+    return ""
 
 
 def _cursor_sdk_slot_flavor(model_id: str) -> str:
@@ -517,7 +565,7 @@ def normalize_cursor_model_id(model_id: str) -> str:
     if not raw:
         return ""
     bare = _cursor_catalog_bare(raw)
-    for suffix, _reasoning, _fast in _CURSOR_SDK_PARAM_SUFFIXES:
+    for suffix in _CURSOR_VARIANT_SUFFIXES:
         if bare.lower().endswith(suffix):
             bare = bare[: -len(suffix)]
             break
@@ -541,26 +589,52 @@ def expand_cursor_model_ids(raw_ids: list[str]) -> list[str]:
     return out
 
 
+# SKU params per catalog variant. Bare grok-4.6 keeps the tuned default
+# (high, not fast) — see cursor_sdk_model. Explicit variants map to their
+# own SKU so picking a cheap "-low-fast" in /model does not silently run
+# the most expensive configuration.
+_GROK_VARIANT_PARAMS: dict[str, list[dict[str, str]]] = {
+    "high-fast": [
+        {"id": "fast", "value": "true"},
+        {"id": "reasoning", "value": "high"},
+    ],
+    "low-fast": [
+        {"id": "fast", "value": "true"},
+        {"id": "reasoning", "value": "low"},
+    ],
+    "fast": [
+        {"id": "fast", "value": "true"},
+        {"id": "reasoning", "value": "high"},
+    ],
+    "low": [
+        {"id": "fast", "value": "false"},
+        {"id": "reasoning", "value": "low"},
+    ],
+    "high": [
+        {"id": "fast", "value": "false"},
+        {"id": "reasoning", "value": "high"},
+    ],
+}
+
+
 def cursor_sdk_model(model_id: str) -> str | dict[str, Any]:
     """SDK inference id plus ``fast`` / ``reasoning`` from the catalog id.
 
     ``Agent.prompt`` accepts ``grok-4.6``, not catalog
     ``cursor-grok-4.6-high-fast``. Suffixes on the picker id become params
     *before* the strip. Bare ``grok-*`` keeps the Nous #88212 pin (high /
-    not-fast) — that was the SKU that produced reasoning tokens.
+    not-fast). Explicit variants (``-low-fast``, ``-high-fast``, ``-fast``,
+    ``-low``, ``-high``) map to matching params; ``-fast`` with no tier
+    still emits both ``fast=true`` and ``reasoning=high``.
     ``grok-4.6-high`` is still rejected, so it never goes on the wire.
     """
     raw = (model_id or "").strip()
     alias = normalize_cursor_model_id(raw) or raw or "grok-4.6"
     if alias.startswith("grok-"):
-        reasoning, fast = _cursor_sdk_params_from_catalog(raw)
-        return {
-            "id": alias,
-            "params": [
-                {"id": "fast", "value": fast},
-                {"id": "reasoning", "value": reasoning},
-            ],
-        }
+        params = _GROK_VARIANT_PARAMS.get(_cursor_variant(model_id))
+        if params is None:
+            params = _GROK_VARIANT_PARAMS["high"]
+        return {"id": alias, "params": [dict(p) for p in params]}
     return alias
 
 
@@ -586,11 +660,13 @@ class CursorSDKClient:
         api_key: str | None = None,
         base_url: str | None = None,
         default_headers: dict[str, str] | None = None,
+        session_id: str | None = None,
         **_: Any,
     ) -> None:
         self.api_key = (api_key or os.environ.get("CURSOR_API_KEY") or "").strip()
         self.base_url = base_url or CURSOR_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
+        self._session_id = (session_id or "").strip() or None
         self.chat = _CursorChatNamespace(self)
         self.is_closed = False
         self._last_usage: Any = None
@@ -604,9 +680,16 @@ class CursorSDKClient:
             or os.environ.get("CURSOR_SDK_CWD")
             or str(Path.cwd().resolve())
         )
+        # Prefer the binding's explicit session id (passed by
+        # create_openai_client from agent.session_id): in multiplex gateway
+        # processes HERMES_SESSION_ID is process-global and can name another
+        # session, which would bleed two Hermes sessions into one Cursor
+        # Agent conversation. HERMES_CURSOR_SESSION stays the manual
+        # override and wins over everything.
         session = (
-            os.environ.get("HERMES_SESSION_ID")
-            or os.environ.get("HERMES_CURSOR_SESSION")
+            os.environ.get("HERMES_CURSOR_SESSION")
+            or self._session_id
+            or os.environ.get("HERMES_SESSION_ID")
             or "default"
         )
         return f"{session}::{model}::{_cursor_sdk_slot_flavor(model)}::{cwd}"
@@ -633,14 +716,13 @@ class CursorSDKClient:
             resume=resume,
         )
         images = extract_cursor_images(messages or [])
-        try:
-            Path("/tmp/cursor_prompt_len.txt").write_text(
-                f"chars={len(prompt_text)} tools={len(hermes_tools_spec(tools))} "
-                f"resume={resume} images={len(images)}\n"
-            )
-            _log_cursor_images(images)
-        except Exception:
-            pass
+        log.debug(
+            "cursor turn: chars=%d tools=%d resume=%s images=%d",
+            len(prompt_text),
+            len(hermes_tools_spec(tools)),
+            resume,
+            len(images),
+        )
         response_text = self._run_turn(
             prompt_text, model=model_id, resume=resume, images=images
         )
@@ -681,9 +763,12 @@ class CursorSDKClient:
         images: list[dict[str, Any]] | None = None,
     ) -> str:
         if not self.api_key:
+            from hermes_constants import display_hermes_home
+
             raise RuntimeError(
                 "CURSOR_API_KEY is not set. Create a key at "
-                "https://cursor.com/dashboard/api and put it in ~/.hermes/.env."
+                f"https://cursor.com/dashboard/api and put it in "
+                f"{display_hermes_home()}/.env."
             )
         try:
             from cursor_sdk import Agent
@@ -707,12 +792,7 @@ class CursorSDKClient:
         if not cwd:
             cwd = str(Path.cwd().resolve())
 
-        try:
-            Path("/tmp/cursor_model_sel.txt").write_text(
-                json.dumps(cursor_sdk_model(model), sort_keys=True)
-            )
-        except Exception:
-            pass
+        log.debug("cursor model select: %s", json.dumps(cursor_sdk_model(model)))
         options = {
             "model": cursor_sdk_model(model),
             "api_key": self.api_key,
@@ -723,8 +803,12 @@ class CursorSDKClient:
 
         self._last_usage = None
         if oneshot:
-            result = Agent.prompt(_cursor_user_message(prompt_text, images), options=options)
+            try:
+                result = Agent.prompt(_cursor_user_message(prompt_text, images), options=options)
+            except Exception as exc:
+                raise _cursor_startup_error(exc, phase="prompt") from exc
             self._last_usage = _cursor_token_usage(result)
+            _raise_for_failed_run(result)
             text = getattr(result, "result", None)
             if isinstance(text, str):
                 return text
@@ -736,16 +820,23 @@ class CursorSDKClient:
         with rec["lock"]:
             _cancel_run(rec)
             if rec.get("agent") is None:
-                rec["agent"] = Agent.create(options=options)
+                try:
+                    rec["agent"] = Agent.create(options=options)
+                except Exception as exc:
+                    raise _cursor_startup_error(exc, phase="agent create") from exc
             try:
                 run = rec["agent"].send(_cursor_user_message(prompt_text, images))
             except Exception as exc:
                 if "already has active run" not in str(exc).lower():
-                    rec["agent"] = None
-                    raise
+                    _drop_agent(rec)
+                    raise _cursor_startup_error(exc, phase="send") from exc
                 _drop_agent(rec)
-                rec["agent"] = Agent.create(options=options)
-                run = rec["agent"].send(_cursor_user_message(prompt_text, images))
+                try:
+                    rec["agent"] = Agent.create(options=options)
+                    run = rec["agent"].send(_cursor_user_message(prompt_text, images))
+                except Exception as retry_exc:
+                    _drop_agent(rec)
+                    raise _cursor_startup_error(retry_exc, phase="send") from retry_exc
             rec["run"] = run
         try:
             waited = None
@@ -753,6 +844,7 @@ class CursorSDKClient:
             if callable(wait):
                 waited = wait()
             self._last_usage = _cursor_token_usage(waited) or _cursor_token_usage(run)
+            _raise_for_failed_run(waited, run)
             text = getattr(run, "text", None)
             if callable(text):
                 text = text()
@@ -765,7 +857,10 @@ class CursorSDKClient:
             if isinstance(waited_text, str):
                 return waited_text
             return "" if text is None else str(text or "")
-        except Exception:
+        except BaseException:
+            # KeyboardInterrupt (Ctrl-C) is not an Exception: without this the
+            # run pointer was cleared in `finally` without cancel(), leaving a
+            # live Cursor run burning subscription tokens after the interrupt.
             with rec["lock"]:
                 if rec.get("run") is run:
                     _drop_agent(rec)
