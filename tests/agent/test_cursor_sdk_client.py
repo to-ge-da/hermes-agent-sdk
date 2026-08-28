@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from agent.cursor_sdk_client import (
     CursorSDKClient,
+    _cursor_sdk_slot_flavor,
     _openai_usage_from_cursor,
     cursor_sdk_model,
     extract_cursor_images,
@@ -21,17 +22,48 @@ from agent.cursor_sdk_client import (
 
 def test_normalize_cursor_model_id_strips_catalog_affixes():
     assert normalize_cursor_model_id("cursor-grok-4.6-high-fast") == "grok-4.6"
+    assert normalize_cursor_model_id("cursor-grok-4.5-high") == "grok-4.5"
     assert normalize_cursor_model_id("grok-4.6") == "grok-4.6"
     assert normalize_cursor_model_id("composer-2.5") == "composer-2.5"
 
 
-def test_cursor_sdk_model_uses_high_without_fast_for_grok():
+def _params(sel):
+    return {p["id"]: p["value"] for p in sel["params"]}
+
+
+def test_cursor_sdk_model_uses_high_without_fast_for_bare_grok():
+    """Suffix-less grok-* keeps the Nous #88212 pin (reasoning tokens)."""
     sel = cursor_sdk_model("grok-4.6")
     assert sel["id"] == "grok-4.6"
-    params = {p["id"]: p["value"] for p in sel["params"]}
+    params = _params(sel)
     assert params["fast"] == "false"
     assert params["reasoning"] == "high"
     assert cursor_sdk_model("composer-2.5") == "composer-2.5"
+
+
+def test_cursor_sdk_model_honors_catalog_high_fast_suffix():
+    sel = cursor_sdk_model("cursor-grok-4.6-high-fast")
+    assert sel["id"] == "grok-4.6"
+    params = _params(sel)
+    assert params["fast"] == "true"
+    assert params["reasoning"] == "high"
+
+
+def test_cursor_sdk_model_honors_catalog_high_without_fast():
+    sel = cursor_sdk_model("cursor-grok-4.5-high")
+    assert sel["id"] == "grok-4.5"
+    params = _params(sel)
+    assert params["fast"] == "false"
+    assert params["reasoning"] == "high"
+
+
+def test_cursor_sdk_slot_flavor_separates_fast_from_nofast():
+    assert _cursor_sdk_slot_flavor("grok-4.6") == "high-nofast"
+    assert _cursor_sdk_slot_flavor("cursor-grok-4.6-high-fast") == "high-fast"
+    assert _cursor_sdk_slot_flavor("cursor-grok-4.5-high") == "high-nofast"
+    assert _cursor_sdk_slot_flavor("composer-2.5") == "plain"
+    client = CursorSDKClient(api_key="crsr_test")
+    assert client._slot_key("grok-4.6") != client._slot_key("cursor-grok-4.6-high-fast")
 
 
 def test_expand_cursor_model_ids_adds_short_aliases():

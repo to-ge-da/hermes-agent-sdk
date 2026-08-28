@@ -470,13 +470,54 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+# Longest first. Catalog ids like cursor-grok-4.6-high-fast map to SDK params;
+# Agent.prompt still receives the stripped id (it rejects the catalog string).
+_CURSOR_SDK_PARAM_SUFFIXES: tuple[tuple[str, str, str], ...] = (
+    ("-high-fast", "high", "true"),
+    ("-low-fast", "low", "true"),
+    ("-high", "high", "false"),
+    ("-fast", "high", "true"),
+)
+
+# Nous #88212 pin: suffix-less grok-* is high / not-fast (reasoning tokens).
+_GROK_DEFAULT_REASONING = "high"
+_GROK_DEFAULT_FAST = "false"
+
+
+def _cursor_catalog_bare(model_id: str) -> str:
+    raw = (model_id or "").strip()
+    if raw.lower().startswith("cursor-"):
+        return raw[7:]
+    return raw
+
+
+def _cursor_sdk_params_from_catalog(model_id: str) -> tuple[str, str]:
+    """Return ``(reasoning, fast)`` from suffixes on the raw catalog id."""
+    lower = _cursor_catalog_bare(model_id).lower()
+    for suffix, reasoning, fast in _CURSOR_SDK_PARAM_SUFFIXES:
+        if lower.endswith(suffix):
+            return reasoning, fast
+    return _GROK_DEFAULT_REASONING, _GROK_DEFAULT_FAST
+
+
+def _cursor_sdk_slot_flavor(model_id: str) -> str:
+    """Agent-slot tag so high vs high-fast do not reuse each other's Agent."""
+    sel = cursor_sdk_model(model_id)
+    if not isinstance(sel, dict):
+        return "plain"
+    params = {p["id"]: str(p["value"]).lower() for p in sel.get("params") or []}
+    reasoning = params.get("reasoning") or _GROK_DEFAULT_REASONING
+    speed = "fast" if params.get("fast") == "true" else "nofast"
+    return f"{reasoning}-{speed}"
+
+
 def normalize_cursor_model_id(model_id: str) -> str:
     """Return the Hermes-facing slug for a Cursor catalog id."""
     raw = (model_id or "").strip()
     if not raw:
         return ""
-    bare = raw[7:] if raw.lower().startswith("cursor-") else raw
-    for suffix in ("-high-fast", "-low-fast", "-high", "-fast"):
+    bare = _cursor_catalog_bare(raw)
+    for suffix, _reasoning, _fast in _CURSOR_SDK_PARAM_SUFFIXES:
         if bare.lower().endswith(suffix):
             bare = bare[: -len(suffix)]
             break
@@ -501,21 +542,23 @@ def expand_cursor_model_ids(raw_ids: list[str]) -> list[str]:
 
 
 def cursor_sdk_model(model_id: str) -> str | dict[str, Any]:
-    """SDK inference id plus high / not-fast params.
+    """SDK inference id plus ``fast`` / ``reasoning`` from the catalog id.
 
-    Live 2026-08-17: Agent.prompt accepts ``grok-4.6``, not catalog
-    ``cursor-grok-4.6-high-fast``. Bare ``grok-4.6`` is the high-fast SKU
-    (no reasoning_tokens). ``params: [{id: fast, value: false}]`` is the
-    only setting that produced reasoning tokens. ``grok-4.6-high`` is
-    rejected. This session stays on grok-4.6 high without fast.
+    ``Agent.prompt`` accepts ``grok-4.6``, not catalog
+    ``cursor-grok-4.6-high-fast``. Suffixes on the picker id become params
+    *before* the strip. Bare ``grok-*`` keeps the Nous #88212 pin (high /
+    not-fast) — that was the SKU that produced reasoning tokens.
+    ``grok-4.6-high`` is still rejected, so it never goes on the wire.
     """
-    alias = normalize_cursor_model_id(model_id) or (model_id or "").strip() or "grok-4.6"
+    raw = (model_id or "").strip()
+    alias = normalize_cursor_model_id(raw) or raw or "grok-4.6"
     if alias.startswith("grok-"):
+        reasoning, fast = _cursor_sdk_params_from_catalog(raw)
         return {
             "id": alias,
             "params": [
-                {"id": "fast", "value": "false"},
-                {"id": "reasoning", "value": "high"},
+                {"id": "fast", "value": fast},
+                {"id": "reasoning", "value": reasoning},
             ],
         }
     return alias
@@ -566,7 +609,7 @@ class CursorSDKClient:
             or os.environ.get("HERMES_CURSOR_SESSION")
             or "default"
         )
-        return f"{session}::{model}::high-nofast::{cwd}"
+        return f"{session}::{model}::{_cursor_sdk_slot_flavor(model)}::{cwd}"
 
     def _create_chat_completion(
         self,
