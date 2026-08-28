@@ -258,8 +258,6 @@ def _cursor_startup_error(exc: Exception, *, phase: str) -> RuntimeError:
     """
     text = str(exc).strip() or exc.__class__.__name__
     if any(hint in text.lower() for hint in _CURSOR_AUTH_HINTS):
-        from hermes_constants import display_hermes_home
-
         return RuntimeError(
             "Cursor rejected the API key (authentication failed). Check "
             f"CURSOR_API_KEY in {display_hermes_home()}/.env or regenerate it at "
@@ -1142,8 +1140,6 @@ class CursorSDKClient:
         slot: str | None = None,
     ) -> str:
         if not self.api_key:
-            from hermes_constants import display_hermes_home
-
             raise CursorSDKError(
                 "CURSOR_API_KEY is not set. Create a key at "
                 f"https://cursor.com/dashboard/api and put it in "
