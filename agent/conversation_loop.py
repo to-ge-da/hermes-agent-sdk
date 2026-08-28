@@ -5999,6 +5999,12 @@ def run_conversation(
                             "Nous model access",
                         ):
                             pass
+                        elif _provider in {"cursor", "cursor-sdk", "cursor-composer"} and status_code == 401:
+                            from hermes_constants import display_hermes_home as _dhh_fn
+                            agent._vprint(f"{agent.log_prefix}   💡 Cursor rejected CURSOR_API_KEY (HTTP 401). To fix:", force=True)
+                            agent._vprint(f"{agent.log_prefix}      1. Create a new dashboard key: https://cursor.com/dashboard/api", force=True)
+                            agent._vprint(f"{agent.log_prefix}      2. Set CURSOR_API_KEY in {_dhh_fn()}/.env (or run `hermes setup`).", force=True)
+                            agent._vprint(f"{agent.log_prefix}      3. Restart Hermes — the Cursor agent caches the key per session.", force=True)
                         elif _provider in {"openai-codex", "xai-oauth", "nous"} and status_code == 401:
                             if _provider == "openai-codex":
                                 agent._vprint(f"{agent.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
