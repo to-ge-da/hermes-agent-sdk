@@ -661,12 +661,17 @@ class CursorSDKClient:
         base_url: str | None = None,
         default_headers: dict[str, str] | None = None,
         session_id: str | None = None,
+        session_id_fn: Any = None,
         **_: Any,
     ) -> None:
         self.api_key = (api_key or os.environ.get("CURSOR_API_KEY") or "").strip()
         self.base_url = base_url or CURSOR_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
+        # Snapshot captured at construction — often None because agent_init
+        # builds the client before assigning session_id. Prefer session_id_fn
+        # (live agent.session_id) so /new rotation is visible at slot-key time.
         self._session_id = (session_id or "").strip() or None
+        self._session_id_fn = session_id_fn if callable(session_id_fn) else None
         self.chat = _CursorChatNamespace(self)
         self.is_closed = False
         self._last_usage: Any = None
@@ -674,21 +679,36 @@ class CursorSDKClient:
     def close(self) -> None:
         self.is_closed = True
 
+    def _bound_session_id(self) -> str | None:
+        fn = self._session_id_fn
+        if fn is not None:
+            try:
+                live = fn()
+            except Exception:
+                live = None
+            if isinstance(live, str):
+                live = live.strip() or None
+            else:
+                live = None
+            if live:
+                return live
+        return self._session_id
+
     def _slot_key(self, model: str) -> str:
         cwd = (
             os.environ.get("HERMES_CURSOR_SDK_CWD")
             or os.environ.get("CURSOR_SDK_CWD")
             or str(Path.cwd().resolve())
         )
-        # Prefer the binding's explicit session id (passed by
-        # create_openai_client from agent.session_id): in multiplex gateway
-        # processes HERMES_SESSION_ID is process-global and can name another
-        # session, which would bleed two Hermes sessions into one Cursor
-        # Agent conversation. HERMES_CURSOR_SESSION stays the manual
-        # override and wins over everything.
+        # Prefer the owning agent's live session id over a construction-time
+        # snapshot: create_openai_client runs at agent_init *before* session_id
+        # is assigned, and /new rotates the id without rebuilding the client.
+        # HERMES_SESSION_ID is process-global and bleeds multiplexed gateway
+        # sessions into one Cursor Agent conversation. HERMES_CURSOR_SESSION
+        # stays the manual override and wins over everything.
         session = (
             os.environ.get("HERMES_CURSOR_SESSION")
-            or self._session_id
+            or self._bound_session_id()
             or os.environ.get("HERMES_SESSION_ID")
             or "default"
         )

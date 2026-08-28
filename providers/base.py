@@ -173,9 +173,12 @@ class ProviderProfile:
         Used by providers that are not HTTP chat-completions (ACP, Agent SDK
         shims). Default None keeps the standard OpenAI() construction path.
 
-        ``kwargs`` carries the usual client kwargs plus ``session_id`` — the
-        owning agent's session id, for profiles that hold per-conversation
-        state (accept and ignore it when stateless).
+        ``kwargs`` carries the usual client kwargs plus ``session_id`` (a
+        construction-time snapshot of the owning agent's session id) and
+        ``session_id_fn`` (zero-arg callable returning the live id). Prefer
+        the callable: the client is built at ``agent_init`` before
+        ``session_id`` is assigned, and ``/new`` rotates the id without
+        rebuilding the client. Stateless profiles should ignore both.
         """
         return None
 

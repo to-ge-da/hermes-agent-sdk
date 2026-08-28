@@ -626,3 +626,87 @@ def test_slot_key_prefers_explicit_session_id_over_process_env(monkeypatch):
     plain = CursorSDKClient(api_key="crsr_test")
     monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
     assert plain._slot_key("grok-4.6").startswith("env-session::")
+
+
+def test_slot_key_tracks_live_session_id_fn_after_init_and_rotation(monkeypatch):
+    """session_id_fn is read at slot-key time, not frozen at construction.
+
+    Mirrors agent_init (client built while session_id is still None) and
+    /new (session_id rotates without rebuilding the client).
+    """
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-session")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+    state = {"sid": None}
+    client = CursorSDKClient(
+        api_key="crsr_test",
+        session_id=None,
+        session_id_fn=lambda: state["sid"],
+    )
+    # Construction-time None must not pin the slot to the process env forever.
+    assert client._slot_key("grok-4.6").startswith("env-session::")
+    state["sid"] = "assigned-after-init"
+    assert client._slot_key("grok-4.6").startswith("assigned-after-init::")
+    state["sid"] = "rotated-by-new"
+    assert client._slot_key("grok-4.6").startswith("rotated-by-new::")
+    # Stale constructor snapshot must not win over the live getter.
+    stale = CursorSDKClient(
+        api_key="crsr_test",
+        session_id="frozen-at-init",
+        session_id_fn=lambda: state["sid"],
+    )
+    assert stale._slot_key("grok-4.6").startswith("rotated-by-new::")
+    # Manual override env still wins over the live getter.
+    monkeypatch.setenv("HERMES_CURSOR_SESSION", "pinned")
+    assert client._slot_key("grok-4.6").startswith("pinned::")
+
+
+def test_create_openai_client_live_session_id_survives_init_order_and_new(monkeypatch):
+    """Wiring: create_openai_client before session_id, then /new, same client."""
+    from agent.agent_runtime_helpers import create_openai_client
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "process-global")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+
+    kwargs = {"api_key": "crsr_test", "base_url": "cursor-sdk://local"}
+    agent_a = SimpleNamespace(
+        provider="cursor",
+        session_id=None,
+        _client_log_context=lambda: "",
+    )
+    agent_b = SimpleNamespace(
+        provider="cursor",
+        session_id=None,
+        _client_log_context=lambda: "",
+    )
+    with patch("agent.agent_runtime_helpers._ra") as ra:
+        ra.return_value.logger.info = lambda *a, **k: None
+        client_a = create_openai_client(
+            agent_a, kwargs, reason="agent_init", shared=True
+        )
+        client_b = create_openai_client(
+            agent_b, kwargs, reason="agent_init", shared=True
+        )
+
+    assert isinstance(client_a, CursorSDKClient)
+    assert isinstance(client_b, CursorSDKClient)
+    # Snapshot at agent_init is None — process env would bleed both slots.
+    assert client_a._session_id is None
+    assert client_b._session_id is None
+    assert client_a._slot_key("grok-4.6").startswith("process-global::")
+
+    # agent_init then assigns session_id (lines ~1577–1584) without rebuild.
+    agent_a.session_id = "session-a"
+    agent_b.session_id = "session-b"
+    key_a = client_a._slot_key("grok-4.6")
+    key_b = client_b._slot_key("grok-4.6")
+    assert key_a.startswith("session-a::")
+    assert key_b.startswith("session-b::")
+    assert key_a != key_b
+
+    # /new rotates agent.session_id on the same client instance.
+    agent_a.session_id = "session-a-after-new"
+    assert client_a._slot_key("grok-4.6").startswith("session-a-after-new::")
+    assert client_b._slot_key("grok-4.6").startswith("session-b::")
