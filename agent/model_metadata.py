@@ -729,11 +729,20 @@ _URL_TO_PROVIDER: Dict[str, str] = {
 
 # Auto-extend with hostnames derived from provider profiles.
 # Any provider with a base_url not already in the map gets added automatically.
+# Skip non-HTTP marker URLs (cursor-sdk://local, acp://copilot): their
+# hostnames ("local", "copilot") are not DNS names, and substring-matching
+# them against real URLs would classify localhost Ollama as "cursor".
 try:
     for _pp in _list_providers():
         _host = _pp.get_hostname()
-        if _host and _host not in _URL_TO_PROVIDER:
-            _URL_TO_PROVIDER[_host] = _pp.name
+        if not _host or _host in _URL_TO_PROVIDER:
+            continue
+        _scheme = ""
+        if getattr(_pp, "base_url", None):
+            _scheme = (urlparse(_pp.base_url).scheme or "").lower()
+        if _scheme and _scheme not in ("http", "https"):
+            continue
+        _URL_TO_PROVIDER[_host] = _pp.name
 except Exception:
     pass
 
@@ -750,9 +759,18 @@ def _infer_provider_from_url(base_url: str) -> Optional[str]:
         return None
     parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")
     host = parsed.netloc.lower() or parsed.path.lower()
+    hostname = (parsed.hostname or "").lower()
     for url_part, provider in _URL_TO_PROVIDER.items():
-        if url_part in host:
-            return provider
+        if url_part not in host:
+            continue
+        # Dot-less keys must match the hostname exactly. Otherwise "local"
+        # (from cursor-sdk://local) substring-matches "localhost" and Ollama
+        # tagged models like qwen3.5:27b never reach endpoint metadata lookup
+        # — they fall through to the "qwen" catalog catch-all (131072).
+        if "." not in url_part.lstrip("."):
+            if hostname != url_part:
+                continue
+        return provider
     return None
 
 

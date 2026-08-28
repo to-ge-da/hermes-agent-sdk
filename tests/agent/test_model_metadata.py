@@ -1128,6 +1128,22 @@ class TestStripProviderPrefix:
     def test_ollama_model_tag_is_unchanged(self):
         assert _strip_provider_prefix("qwen3.5:27b") == "qwen3.5:27b"
 
+    def test_localhost_ollama_is_not_a_known_provider_url(self):
+        """Loopback Ollama must reach the custom-endpoint metadata path.
+
+        Marker URL hostnames like ``local`` (from ``cursor-sdk://local``)
+        must not substring-match ``localhost`` and skip endpoint lookup —
+        otherwise tagged models such as ``qwen3.5:27b`` miss their
+        per-endpoint context length and fall through to the ``qwen``
+        catalog catch-all (131072).
+        """
+        from agent.model_metadata import (
+            _infer_provider_from_url,
+            _is_known_provider_base_url,
+        )
+        assert _infer_provider_from_url("http://localhost:11434/v1") is None
+        assert _is_known_provider_base_url("http://localhost:11434/v1") is False
+
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_ollama_model_tag_not_mangled_in_context_lookup(self, mock_fetch):
         """Ensure 'qwen3.5:27b' is NOT reduced to '27b' during context length lookup.
