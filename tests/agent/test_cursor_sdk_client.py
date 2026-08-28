@@ -13,6 +13,7 @@ from agent.cursor_sdk_client import (
     CursorSDKError,
     _cursor_sdk_slot_flavor,
     _openai_usage_from_cursor,
+    cursor_aux_http_twin,
     cursor_image_key,
     cursor_sdk_error,
     cursor_sdk_model,
@@ -21,6 +22,7 @@ from agent.cursor_sdk_client import (
     format_hermes_cursor_prompt,
     hermes_tools_spec,
     history_was_rewritten,
+    is_grok_cursor_model,
     normalize_cursor_model_id,
     split_cursor_model_id,
     transcript_anchor,
@@ -628,6 +630,16 @@ def test_split_cursor_model_id_strips_tier_and_fast_together():
         assert normalize_cursor_model_id(raw) == "grok-4.6"
 
 
+def test_cursor_aux_http_twin_only_maps_grok_skus():
+    assert cursor_aux_http_twin("cursor-grok-4.6-high-fast") == ("xai-oauth", "grok-4.6")
+    assert cursor_aux_http_twin("grok-4.6") == ("xai-oauth", "grok-4.6")
+    assert cursor_aux_http_twin("cursor-claude-opus-5-high") is None
+    assert cursor_aux_http_twin("composer-2.5") is None
+    assert cursor_aux_http_twin("gpt-5.5") is None
+    assert is_grok_cursor_model("cursor-grok-4.6-low-fast") is True
+    assert is_grok_cursor_model("claude-opus-5") is False
+
+
 def test_cursor_sdk_model_honors_catalog_reasoning_tier():
     low = cursor_sdk_model("cursor-grok-4.6-low-fast")
     assert low["id"] == "grok-4.6"
@@ -648,6 +660,22 @@ def test_cursor_sdk_error_classifies_auth_and_quota():
     assert "usage limit" in str(quota).lower()
     unknown = cursor_sdk_error(RuntimeError("bridge exited"), phase="send")
     assert unknown.status_code == 502
+
+
+def test_cursor_sdk_error_uses_profile_aware_home():
+    with patch(
+        "agent.cursor_sdk_client.display_hermes_home",
+        return_value="~/.hermes/profiles/coder",
+    ):
+        auth = cursor_sdk_error(
+            RuntimeError("401 Unauthorized: invalid api key"), phase="send"
+        )
+        try:
+            CursorSDKClient(api_key="")._run_prompt("hi", model="grok-4.6")
+            raise AssertionError("expected missing-key error")
+        except CursorSDKError as exc:
+            assert "~/.hermes/profiles/coder/.env" in str(exc)
+    assert "~/.hermes/profiles/coder/.env" in str(auth)
 
 
 def test_missing_key_error_is_classified_as_auth():

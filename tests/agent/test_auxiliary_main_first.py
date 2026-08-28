@@ -185,6 +185,12 @@ class TestResolveAutoMainFirst:
             "agent.auxiliary_client._try_configured_fallback_chain",
             return_value=(None, None, None),
         ), patch(
+            "agent.auxiliary_client._try_main_fallback_chain",
+            return_value=(None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_provider_chain",
+            return_value=(),
+        ), patch(
             "agent.auxiliary_client._is_provider_unhealthy", return_value=False
         ):
             from agent.auxiliary_client import _resolve_auto
@@ -204,7 +210,10 @@ class TestResolveAutoMainFirst:
 
         routed = [call.args[:2] for call in mock_resolve.call_args_list]
         assert not any(provider == "xai-oauth" for provider, _model in routed)
-        assert not any("claude" in str(model or "") for _p, model in routed if _p == "xai-oauth")
+        assert not any(
+            provider in {"cursor", "cursor-sdk", "cursor-composer"}
+            for provider, _model in routed
+        )
 
     def test_main_unavailable_uses_task_fallback_chain_before_builtin_chain(self):
         """Auto aux resolution honors auxiliary.<task>.fallback_chain before built-ins."""
@@ -333,6 +342,99 @@ class TestResolveVisionMainFirst:
         assert mock_resolve.call_args.args[0] == "openrouter"
         assert mock_resolve.call_args.args[1] == "anthropic/claude-sonnet-4.6"
         assert mock_resolve.call_args.kwargs.get("is_vision") is True
+
+    def test_cursor_grok_main_vision_uses_xai_http_twin(self):
+        """Cursor Grok vision must hit xAI HTTP, never the Cursor agent SDK."""
+        mock_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "grok-4.6"),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._main_model_supports_vision",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client._resolve_provider_vision_default",
+            return_value=None,
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                main_runtime={
+                    "provider": "cursor",
+                    "model": "cursor-grok-4.6-high-fast",
+                    "base_url": "cursor-sdk://local",
+                    "api_key": "crsr_test",
+                }
+            )
+
+        assert provider == "xai-oauth"
+        assert client is mock_client
+        assert model == "grok-4.6"
+        assert mock_resolve.call_args.args[:2] == ("xai-oauth", "grok-4.6")
+        assert mock_resolve.call_args.kwargs.get("is_vision") is True
+        # CURSOR_API_KEY must not be forwarded as an xAI credential.
+        assert mock_resolve.call_args.kwargs.get("explicit_api_key") in (None, "")
+        assert mock_resolve.call_args.kwargs.get("explicit_base_url") in (None, "")
+
+    def test_cursor_non_grok_main_vision_never_uses_cursor_sdk(self):
+        """A Cursor Claude SKU must not become a vision CursorSDKClient."""
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._resolve_strict_vision_backend",
+            return_value=(None, None),
+        ):
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                main_runtime={
+                    "provider": "cursor",
+                    "model": "cursor-claude-opus-5-high",
+                    "base_url": "cursor-sdk://local",
+                    "api_key": "crsr_test",
+                }
+            )
+
+        assert client is None
+        assert model is None
+        assert provider is None
+        routed = [call.args[:2] for call in mock_resolve.call_args_list]
+        assert not any(
+            p in {"cursor", "cursor-sdk", "cursor-composer"} for p, _m in routed
+        )
+        assert not any(p == "xai-oauth" and "claude" in str(m or "") for p, m in routed)
+
+    def test_cursor_main_is_not_listed_as_a_vision_backend(self):
+        """Setup/tool gating must not treat the Cursor SDK as a vision HTTP backend."""
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="cursor",
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="cursor-claude-opus-5-high",
+        ), patch(
+            "agent.auxiliary_client._strict_vision_backend_available",
+            return_value=False,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(MagicMock(), "claude-opus-5"),
+        ) as mock_resolve:
+            from agent.auxiliary_client import get_available_vision_backends
+
+            backends = get_available_vision_backends()
+
+        assert "cursor" not in backends
+        assert "cursor-sdk" not in backends
+        routed = [call.args[:2] for call in mock_resolve.call_args_list]
+        assert not any(
+            p in {"cursor", "cursor-sdk", "cursor-composer"} for p, _m in routed
+        )
 
 
 

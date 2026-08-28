@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.copilot_acp_client import _extract_tool_calls_from_text
+from hermes_constants import display_hermes_home
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +123,8 @@ def cursor_sdk_error(exc: Exception, *, phase: str) -> CursorSDKError:
         return CursorSDKError(
             "Cursor rejected CURSOR_API_KEY. Create a fresh dashboard key at "
             "https://cursor.com/dashboard/api and update it in "
-            f"~/.hermes/.env, then restart Hermes. (cursor-sdk {phase}: {detail})",
+            f"{display_hermes_home()}/.env, then restart Hermes. "
+            f"(cursor-sdk {phase}: {detail})",
             status_code=401,
         )
     if any(marker in low for marker in _QUOTA_MARKERS):
@@ -822,6 +824,29 @@ def _cursor_sdk_slot_flavor(model_id: str) -> str:
     reasoning = params.get("reasoning") or _GROK_DEFAULT_REASONING
     speed = "fast" if params.get("fast") == "true" else "nofast"
     return f"{reasoning}-{speed}"
+
+
+CURSOR_PROVIDER_NAMES = frozenset({"cursor", "cursor-sdk", "cursor-composer"})
+
+
+def is_grok_cursor_model(model_id: str) -> bool:
+    """True when *model_id* is a Grok SKU after catalog-affix stripping."""
+    bare = normalize_cursor_model_id(model_id).lower()
+    return bare == "grok" or bare.startswith("grok-")
+
+
+def cursor_aux_http_twin(model_id: str) -> tuple[str, str] | None:
+    """HTTP ``(provider, model)`` for auxiliary tasks, or ``None``.
+
+    Cursor has no chat-completions endpoint. Grok SKUs are served by xAI
+    under the same id, so compression / titles / vision can reuse that
+    HTTP twin. Claude, Composer, GPT and Gemini SKUs have no twin — the
+    caller must fall through to normal auto-detection rather than asking
+    xAI for ``claude-opus-5`` (which 404s every auxiliary call).
+    """
+    if not is_grok_cursor_model(model_id or "grok-4.6"):
+        return None
+    return "xai-oauth", normalize_cursor_model_id(model_id or "grok-4.6")
 
 
 def expand_cursor_model_ids(raw_ids: list[str]) -> list[str]:

@@ -5754,6 +5754,54 @@ def _resolve_single_provider(
     )
     return client
 
+
+def _is_cursor_aux_provider(provider: str) -> bool:
+    try:
+        from agent.cursor_sdk_client import CURSOR_PROVIDER_NAMES
+
+        names = CURSOR_PROVIDER_NAMES
+    except ImportError:
+        names = {"cursor", "cursor-sdk", "cursor-composer"}
+    return str(provider or "").strip().lower() in names
+
+
+def _remap_cursor_aux_main(
+    main_provider: str,
+    main_model: str,
+    *,
+    task: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Rewrite a Cursor main into an HTTP aux provider, or clear it.
+
+    Cursor has no chat-completions endpoint, so auxiliary work cannot stay
+    on ``cursor-sdk://``. Grok SKUs have an xAI twin; every other SKU falls
+    through to auto-detection (empty provider/model).
+    """
+    if not _is_cursor_aux_provider(main_provider):
+        return main_provider, main_model
+    twin = None
+    try:
+        from agent.cursor_sdk_client import cursor_aux_http_twin
+
+        twin = cursor_aux_http_twin(main_model)
+    except ImportError:
+        lowered = str(main_model or "").strip().lower()
+        if lowered.startswith("cursor-"):
+            lowered = lowered[len("cursor-"):]
+        # Naive strip leaves ``grok-4.6-high-fast``; xAI still accepts the
+        # grok- prefix even when the suffix survives.
+        if lowered == "grok" or lowered.startswith("grok-"):
+            twin = ("xai-oauth", lowered)
+    if twin:
+        return twin
+    logger.debug(
+        "Auxiliary task %s: cursor model %s has no xAI HTTP twin — "
+        "resolving an auxiliary provider by auto-detection",
+        task, main_model,
+    )
+    return "", ""
+
+
 def _resolve_auto_route(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
@@ -5846,34 +5894,21 @@ def _resolve_auto_route(
             runtime_api_mode = ""
 
     # Cursor Agent SDK is not an OpenAI chat endpoint. Same-model policy for
-    # auxiliary tasks (compression, titles, …) means the same Grok slug on
-    # xAI's HTTP API, not OpenRouter and not cursor-sdk://.
+    # auxiliary tasks (compression, titles, vision, …) means the same Grok
+    # slug on xAI's HTTP API, not OpenRouter and not cursor-sdk://.
     #
     # Only Grok slugs travel: Cursor also serves Claude, Composer, GPT and
     # Gemini SKUs, and handing xAI a ``claude-opus-5`` model id 404s every
     # compression/title/vision call for the whole session. Those fall through
     # to normal auto-detection, which picks whatever HTTP provider the user
     # actually has (and degrades gracefully when they have none).
-    if main_provider in {"cursor", "cursor-sdk", "cursor-composer"}:
-        try:
-            from agent.cursor_sdk_client import normalize_cursor_model_id
-
-            _cursor_model = normalize_cursor_model_id(main_model or "grok-4.6")
-        except Exception:
-            _cursor_model = main_model or "grok-4.6"
-            if _cursor_model.startswith("cursor-"):
-                _cursor_model = _cursor_model[len("cursor-"):]
-        if _cursor_model.startswith("grok"):
-            main_provider = "xai-oauth"
-            main_model = _cursor_model
-        else:
-            logger.debug(
-                "Auxiliary task %s: cursor model %s has no xAI HTTP twin — "
-                "resolving an auxiliary provider by auto-detection",
-                task, main_model,
-            )
-            main_provider = ""
-            main_model = ""
+    if _is_cursor_aux_provider(main_provider):
+        _twin_provider, _twin_model = _remap_cursor_aux_main(
+            main_provider, main_model, task=task,
+        )
+        main_provider, main_model = _twin_provider, _twin_model
+        # CURSOR_API_KEY / cursor-sdk:// are not an xAI (or aggregator)
+        # credential. Drop them so the twin resolves through its own auth.
         runtime_base_url = ""
         runtime_api_key = ""
         runtime_api_mode = ""
@@ -7102,12 +7137,19 @@ def get_available_vision_backends() -> List[str]:
     available: List[str] = []
     # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
+    main_model = _read_main_model()
+    if _is_cursor_aux_provider(main_provider):
+        # Cursor SDK is not a vision HTTP backend. Grok SKUs list as xAI;
+        # other SKUs skip the main slot and fall through to aggregators.
+        main_provider, main_model = _remap_cursor_aux_main(
+            main_provider, main_model, task="vision",
+        )
     if main_provider and main_provider not in {"auto", ""}:
         if main_provider in _VISION_AUTO_PROVIDER_ORDER:
             if _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
         else:
-            client, _ = resolve_provider_client(main_provider, _read_main_model())
+            client, _ = resolve_provider_client(main_provider, main_model)
             if client is not None:
                 available.append(main_provider)
     # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
@@ -7202,6 +7244,18 @@ def resolve_vision_provider_client(
                 runtime["base_url"] = ""
                 runtime["api_key"] = ""
                 runtime["api_mode"] = ""
+        elif _is_cursor_aux_provider(main_provider):
+            # Cursor SDK is not an OpenAI vision endpoint. Grok SKUs reuse
+            # xAI's HTTP API; everything else falls through to aggregators.
+            # Drop CURSOR_API_KEY / cursor-sdk:// so they cannot be forwarded
+            # as an xAI (or aggregator) credential.
+            main_provider, main_model = _remap_cursor_aux_main(
+                main_provider, main_model, task="vision",
+            )
+            runtime = dict(runtime)
+            runtime["base_url"] = ""
+            runtime["api_key"] = ""
+            runtime["api_mode"] = ""
         if main_provider and main_provider not in {"auto", "", "moa"}:
             # A provider-specific vision default wins over the user's chat model:
             # static overrides (xiaomi/zai) and catalog-backed discovery (the
