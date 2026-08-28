@@ -6,6 +6,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.cursor_sdk_client import (
     CursorSDKClient,
     _cursor_sdk_slot_flavor,
@@ -457,3 +459,254 @@ def test_run_turn_reads_usage_from_wait_result():
         text = client._run_turn("hi", model="grok-4.6", resume=False)
     assert text == "USAGE_OK"
     assert client._last_usage is cursor_usage
+
+
+def test_run_turn_cancels_and_closes_on_keyboard_interrupt():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    state = {"cancelled": False, "closed": False}
+    run = SimpleNamespace(
+        text=None,
+        wait=lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+        cancel=lambda: state.update(cancelled=True),
+    )
+
+    class _Agent:
+        def send(self, _msg):
+            return run
+
+        def close(self):
+            state["closed"] = True
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(KeyboardInterrupt):
+            client._run_turn("hi", model="grok-4.6", resume=False)
+    assert state["cancelled"] is True
+    assert state["closed"] is True
+
+
+def test_run_turn_raises_on_error_status_instead_of_empty_text():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    state = {"closed": False}
+    waited = SimpleNamespace(status="error", error="model exploded", result=None, usage=None)
+    run = SimpleNamespace(text="", wait=lambda: waited, cancel=lambda: None)
+
+    class _Agent:
+        def send(self, _msg):
+            return run
+
+        def close(self):
+            state["closed"] = True
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(RuntimeError, match="model exploded"):
+            client._run_turn("hi", model="grok-4.6", resume=False)
+    assert state["closed"] is True
+
+
+def test_run_turn_success_status_passes_through():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    waited = SimpleNamespace(status="finished", result="DONE_OK", usage=None)
+    run = SimpleNamespace(text=None, wait=lambda: waited, cancel=lambda: None)
+
+    class _Agent:
+        def send(self, _msg):
+            return run
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        text = client._run_turn("hi", model="grok-4.6", resume=False)
+    assert text == "DONE_OK"
+
+
+def test_startup_error_wraps_auth_failures_with_guidance():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+
+    class _AgentFactory:
+        @staticmethod
+        def create(**_k):
+            raise Exception("CursorAgentError: 401 Unauthorized: invalid key")
+
+    fake = SimpleNamespace(create=_AgentFactory.create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(RuntimeError) as excinfo:
+            client._run_turn("hi", model="grok-4.6", resume=False)
+    msg = str(excinfo.value)
+    assert "CURSOR_API_KEY" in msg
+    assert "cursor.com/dashboard/api" in msg
+    # Original text retained so the Hermes error classifier still sees auth markers.
+    assert "401" in msg and "unauthorized" in msg.lower()
+
+
+def test_send_error_non_active_run_is_wrapped_and_agent_dropped():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    state = {"closed": 0}
+
+    class _Agent:
+        def send(self, _msg):
+            raise Exception("CursorAgentError: connection refused by bridge")
+
+        def close(self):
+            state["closed"] += 1
+
+    fake = SimpleNamespace(create=lambda **_k: _Agent(), prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(RuntimeError, match="send failed"):
+            client._run_turn("hi", model="grok-4.6", resume=False)
+    assert state["closed"] == 1
+
+
+def test_oneshot_prompt_error_is_wrapped():
+    client = CursorSDKClient(api_key="crsr_test")
+
+    def _prompt(*_a, **_k):
+        raise Exception("CursorAgentError: 403 Forbidden")
+
+    fake = SimpleNamespace(create=lambda **_k: None, prompt=_prompt)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(RuntimeError) as excinfo:
+            client._run_prompt("hi", model="grok-4.6")
+    assert "CURSOR_API_KEY" in str(excinfo.value)
+
+
+def test_cursor_sdk_model_honors_catalog_variants():
+    low = cursor_sdk_model("cursor-grok-4.6-low-fast")
+    assert low["id"] == "grok-4.6"
+    assert {p["id"]: p["value"] for p in low["params"]} == {
+        "fast": "true",
+        "reasoning": "low",
+    }
+    high_fast = cursor_sdk_model("cursor-grok-4.6-high-fast")
+    assert {p["id"]: p["value"] for p in high_fast["params"]} == {
+        "fast": "true",
+        "reasoning": "high",
+    }
+    # Bare id keeps the tuned high / not-fast default.
+    bare = cursor_sdk_model("grok-4.6")
+    assert {p["id"]: p["value"] for p in bare["params"]} == {
+        "fast": "false",
+        "reasoning": "high",
+    }
+    assert cursor_sdk_model("composer-2.5") == "composer-2.5"
+
+
+def test_normalize_cursor_model_id_strips_low_variant():
+    assert normalize_cursor_model_id("cursor-grok-4.6-low-fast") == "grok-4.6"
+    assert normalize_cursor_model_id("cursor-grok-4.6-low") == "grok-4.6"
+
+
+def test_slot_key_prefers_explicit_session_id_over_process_env(monkeypatch):
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-session")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+    client = CursorSDKClient(api_key="crsr_test", session_id="agent-session")
+    assert client._slot_key("grok-4.6").startswith("agent-session::")
+    # Manual override env still wins over everything.
+    monkeypatch.setenv("HERMES_CURSOR_SESSION", "pinned")
+    assert client._slot_key("grok-4.6").startswith("pinned::")
+    # No explicit binding falls back to the process env (CLI single session).
+    plain = CursorSDKClient(api_key="crsr_test")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+    assert plain._slot_key("grok-4.6").startswith("env-session::")
+
+
+def test_slot_key_tracks_live_session_id_fn_after_init_and_rotation(monkeypatch):
+    """session_id_fn is read at slot-key time, not frozen at construction.
+
+    Mirrors agent_init (client built while session_id is still None) and
+    /new (session_id rotates without rebuilding the client).
+    """
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-session")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+    state = {"sid": None}
+    client = CursorSDKClient(
+        api_key="crsr_test",
+        session_id=None,
+        session_id_fn=lambda: state["sid"],
+    )
+    # Construction-time None must not pin the slot to the process env forever.
+    assert client._slot_key("grok-4.6").startswith("env-session::")
+    state["sid"] = "assigned-after-init"
+    assert client._slot_key("grok-4.6").startswith("assigned-after-init::")
+    state["sid"] = "rotated-by-new"
+    assert client._slot_key("grok-4.6").startswith("rotated-by-new::")
+    # Stale constructor snapshot must not win over the live getter.
+    stale = CursorSDKClient(
+        api_key="crsr_test",
+        session_id="frozen-at-init",
+        session_id_fn=lambda: state["sid"],
+    )
+    assert stale._slot_key("grok-4.6").startswith("rotated-by-new::")
+    # Manual override env still wins over the live getter.
+    monkeypatch.setenv("HERMES_CURSOR_SESSION", "pinned")
+    assert client._slot_key("grok-4.6").startswith("pinned::")
+
+
+def test_create_openai_client_live_session_id_survives_init_order_and_new(monkeypatch):
+    """Wiring: create_openai_client before session_id, then /new, same client."""
+    from agent.agent_runtime_helpers import create_openai_client
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "process-global")
+    monkeypatch.delenv("HERMES_CURSOR_SESSION", raising=False)
+
+    kwargs = {"api_key": "crsr_test", "base_url": "cursor-sdk://local"}
+    agent_a = SimpleNamespace(
+        provider="cursor",
+        session_id=None,
+        _client_log_context=lambda: "",
+    )
+    agent_b = SimpleNamespace(
+        provider="cursor",
+        session_id=None,
+        _client_log_context=lambda: "",
+    )
+    with patch("agent.agent_runtime_helpers._ra") as ra:
+        ra.return_value.logger.info = lambda *a, **k: None
+        client_a = create_openai_client(
+            agent_a, kwargs, reason="agent_init", shared=True
+        )
+        client_b = create_openai_client(
+            agent_b, kwargs, reason="agent_init", shared=True
+        )
+
+    assert isinstance(client_a, CursorSDKClient)
+    assert isinstance(client_b, CursorSDKClient)
+    # Snapshot at agent_init is None — process env would bleed both slots.
+    assert client_a._session_id is None
+    assert client_b._session_id is None
+    assert client_a._slot_key("grok-4.6").startswith("process-global::")
+
+    # agent_init then assigns session_id (lines ~1577–1584) without rebuild.
+    agent_a.session_id = "session-a"
+    agent_b.session_id = "session-b"
+    key_a = client_a._slot_key("grok-4.6")
+    key_b = client_b._slot_key("grok-4.6")
+    assert key_a.startswith("session-a::")
+    assert key_b.startswith("session-b::")
+    assert key_a != key_b
+
+    # /new rotates agent.session_id on the same client instance.
+    agent_a.session_id = "session-a-after-new"
+    assert client_a._slot_key("grok-4.6").startswith("session-a-after-new::")
+    assert client_b._slot_key("grok-4.6").startswith("session-b::")

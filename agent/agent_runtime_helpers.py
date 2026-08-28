@@ -28,6 +28,7 @@ import logging
 import re
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -2454,6 +2455,31 @@ def anthropic_prompt_cache_policy(
     return False, False
 
 
+def _live_session_id_fn(agent: Any):
+    """Zero-arg getter for ``agent.session_id`` that tracks post-init rotation.
+
+    ``create_openai_client`` runs at ``agent_init`` *before* ``session_id`` is
+    assigned, and ``/new`` (also ``/resume`` / ``/branch``) mutates the id
+    without rebuilding the client. A weakref keeps the getter from pinning
+    the agent alive if the client outlives it; objects that cannot be
+    weak-referenced (test doubles) fall back to a direct capture.
+    """
+    try:
+        agent_ref = weakref.ref(agent)
+    except TypeError:
+        def _live_strong() -> Any:
+            return getattr(agent, "session_id", None)
+
+        return _live_strong
+
+    def _live() -> Any:
+        owner = agent_ref()
+        if owner is None:
+            return None
+        return getattr(owner, "session_id", None)
+
+    return _live
+
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
@@ -2490,7 +2516,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     except Exception:
         profile = None
     if profile is not None:
-        custom = profile.build_openai_client(**client_kwargs)
+        build_kwargs = dict(client_kwargs)
+        build_kwargs.pop("session_id", None)
+        build_kwargs.pop("session_id_fn", None)
+        # Profiles holding per-conversation state (cursor-sdk Agent slots)
+        # key it by the owning session, not the process-global env.
+        # Pass a live getter: this builder runs at agent_init *before*
+        # session_id is assigned, and /new rotates the id without rebuilding
+        # the client. A snapshot here would stay None / stale.
+        build_kwargs["session_id"] = getattr(agent, "session_id", None)
+        build_kwargs["session_id_fn"] = _live_session_id_fn(agent)
+        custom = profile.build_openai_client(**build_kwargs)
         if custom is not None:
             _ra().logger.info(
                 "%s client created (%s, shared=%s) %s",
