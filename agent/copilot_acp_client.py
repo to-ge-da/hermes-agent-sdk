@@ -8,6 +8,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import queue
@@ -35,10 +36,11 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
-_INVOKE_BLOCK_RE = re.compile(
-    r"<invoke\s+[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</invoke>",
+_INVOKE_OPEN_RE = re.compile(
+    r"<invoke\s+[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
     re.DOTALL | re.IGNORECASE,
 )
+_INVOKE_CLOSE_RE = re.compile(r"</invoke\s*>", re.IGNORECASE)
 _PARAMETER_RE = re.compile(
     r"<parameter\s+[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>",
     re.DOTALL | re.IGNORECASE,
@@ -47,10 +49,14 @@ _FUNCTION_CALLS_RE = re.compile(
     r"<function_calls\b[^>]*>.*?</function_calls>",
     re.DOTALL | re.IGNORECASE,
 )
+_FENCED_CODE_RE = re.compile(r"```[^\n]*\r?\n.*?```", re.DOTALL)
 _UNTRANSLATED_MARKUP_RE = re.compile(
-    r"<invoke\b|<parameter\b|<function_calls\b|tool not found",
+    r"<invoke\b|<parameter\b|<function_calls\b",
     re.IGNORECASE,
 )
+# Cursor/ACP empty-allowlist reject. Line-anchored so prose that merely
+# mentions "tool not found" does not trip the fail-once breaker.
+_TOOL_NOT_FOUND_RE = re.compile(r"^Tool not found:", re.IGNORECASE | re.MULTILINE)
 
 # Fail-once copy for bridge XML / empty-allowlist rejects. Keep it terse —
 # dumping the tool catalog here primes the same retry loop (#47967).
@@ -374,7 +380,7 @@ def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleName
 
 
 def _parameter_value(raw: str) -> Any:
-    text = (raw or "").strip()
+    text = html.unescape((raw or "").strip())
     if not text:
         return ""
     if text[:1] in "{[":
@@ -383,6 +389,47 @@ def _parameter_value(raw: str) -> Any:
         except Exception:
             return text
     return text
+
+
+def _spans_overlap(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    for left, right in spans:
+        if start < right and end > left:
+            return True
+    return False
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _fenced_code_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _FENCED_CODE_RE.finditer(text)]
+
+
+def _tool_call_block_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
+
+
+def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in _merge_spans(spans):
+        if cursor < start:
+            parts.append(text[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(text):
+        parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _try_parse_openai_tool_json(raw_json: str) -> dict[str, Any] | None:
@@ -411,23 +458,61 @@ def _try_parse_openai_tool_json(raw_json: str) -> dict[str, Any] | None:
     }
 
 
-def _extract_invoke_xml_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
-    found: list[tuple[int, int, dict[str, Any]]] = []
-    for match in _INVOKE_BLOCK_RE.finditer(text):
-        name = (match.group(1) or "").strip()
-        if not name:
+def _extract_invoke_xml_calls(
+    text: str,
+    skip_spans: list[tuple[int, int]] | None = None,
+) -> list[tuple[int, int, dict[str, Any] | None]]:
+    """Parse top-level ``<invoke>`` blocks; skip consumed/fenced spans.
+
+    Nested ``<invoke>`` is unsupported as a live call: the inner block is
+    rejected, the outer is not emitted (so inner params are not absorbed),
+    and the whole outer span is returned with ``parsed=None`` so callers
+    can strip leftover close tags from cleaned text.
+    """
+    skip_spans = skip_spans or []
+    events: list[tuple[int, str, int, str]] = []
+    for match in _INVOKE_OPEN_RE.finditer(text):
+        events.append((match.start(), "open", match.end(), match.group(1) or ""))
+    for match in _INVOKE_CLOSE_RE.finditer(text):
+        events.append((match.start(), "close", match.end(), ""))
+    events.sort(key=lambda item: (item[0], 0 if item[1] == "open" else 1))
+
+    stack: list[dict[str, Any]] = []
+    found: list[tuple[int, int, dict[str, Any] | None]] = []
+    for pos, kind, end, raw_name in events:
+        if kind == "open":
+            stack.append(
+                {
+                    "name": html.unescape(raw_name.strip()),
+                    "start": pos,
+                    "body_start": end,
+                    "had_child": False,
+                }
+            )
             continue
-        body = match.group(2) or ""
+        if not stack:
+            continue
+        frame = stack.pop()
+        if stack:
+            stack[-1]["had_child"] = True
+            continue
+        span_start = int(frame["start"])
+        if _spans_overlap(span_start, end, skip_spans):
+            continue
+        name = frame["name"]
+        if not name or frame["had_child"]:
+            found.append((span_start, end, None))
+            continue
         args: dict[str, Any] = {}
-        for param in _PARAMETER_RE.finditer(body):
-            key = (param.group(1) or "").strip()
+        for param in _PARAMETER_RE.finditer(text[frame["body_start"] : pos]):
+            key = html.unescape((param.group(1) or "").strip())
             if not key:
                 continue
             args[key] = _parameter_value(param.group(2) or "")
         found.append(
             (
-                match.start(),
-                match.end(),
+                span_start,
+                end,
                 {
                     "name": name,
                     "arguments": json.dumps(args, ensure_ascii=False),
@@ -503,18 +588,42 @@ def _select_hermes_tool_calls(
     calls: list[ChatCompletionMessageToolCall],
     hermes_names: set[str] | None,
 ) -> list[ChatCompletionMessageToolCall]:
-    if not calls:
+    """Return calls whose names are in the offered Hermes set.
+
+    An empty/missing allowlist is not "pass everything through" — that
+    let auxiliary paths (no tools offered) return unknown names and
+    skipped the fail-once breaker. Unknown names stay unselected so
+    ``_bridge_fail_once_error`` can fire.
+    """
+    if not calls or not hermes_names:
         return []
-    if not hermes_names:
-        return list(calls)
-    matched = [call for call in calls if call.function.name in hermes_names]
-    return matched
+    return [call for call in calls if call.function.name in hermes_names]
+
+
+def _unknown_bridge_tool_names(
+    calls: list[ChatCompletionMessageToolCall] | None,
+    hermes_names: set[str] | None,
+) -> list[str]:
+    """Names that must not be silently dropped or passed through."""
+    unknown: list[str] = []
+    for call in calls or []:
+        name = getattr(getattr(call, "function", None), "name", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not hermes_names or name not in hermes_names:
+            unknown.append(name)
+    return unknown
 
 
 def _looks_like_untranslated_bridge_markup(text: str) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
-    return bool(_UNTRANSLATED_MARKUP_RE.search(text))
+    inspect = _strip_spans(
+        text, _fenced_code_spans(text) + _tool_call_block_spans(text)
+    )
+    if _UNTRANSLATED_MARKUP_RE.search(inspect):
+        return True
+    return bool(_TOOL_NOT_FOUND_RE.search(inspect))
 
 
 def _bridge_fail_once_error(
@@ -524,9 +633,13 @@ def _bridge_fail_once_error(
 ) -> str | None:
     """One error when invoke/XML or 'Tool not found' cannot map to a Hermes tool.
 
-    Returns None when a Hermes-named call was produced, or when the text is
-    ordinary assistant output. Does not include the tool catalog.
+    Returns None when every extracted name is a Hermes tool, or when the
+    text is ordinary assistant output. Mixed valid+invalid names fail the
+    turn so the model sees the unknown call (no silent drop). Does not
+    include the tool catalog.
     """
+    if _unknown_bridge_tool_names(tool_calls, hermes_names):
+        return BRIDGE_WRONG_TOOL_FORMAT
     if _select_hermes_tool_calls(tool_calls or [], hermes_names):
         return None
     if not _looks_like_untranslated_bridge_markup(text or ""):
@@ -570,8 +683,10 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
             _try_add_tool_call(raw)
             consumed_spans.append((m.start(), m.end()))
 
-    for start, end, parsed in _extract_invoke_xml_calls(text):
-        _add_parsed(parsed)
+    skip_spans = list(consumed_spans) + _fenced_code_spans(text)
+    for start, end, parsed in _extract_invoke_xml_calls(text, skip_spans=skip_spans):
+        if parsed is not None:
+            _add_parsed(parsed)
         consumed_spans.append((start, end))
 
     if extracted:
@@ -581,17 +696,9 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
     if not consumed_spans:
         return extracted, text.strip()
 
-    consumed_spans.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in consumed_spans:
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
     parts: list[str] = []
     cursor = 0
-    for start, end in merged:
+    for start, end in _merge_spans(consumed_spans):
         if cursor < start:
             parts.append(text[cursor:start])
         cursor = max(cursor, end)
@@ -713,16 +820,14 @@ class CopilotACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         hermes_names = _hermes_tool_names(tools)
-        matched = _select_hermes_tool_calls(tool_calls, hermes_names)
-        if matched:
-            tool_calls = matched
+        fail_once = _bridge_fail_once_error(
+            response_text, tool_calls, hermes_names
+        )
+        if fail_once:
+            tool_calls = []
+            cleaned_text = fail_once
         else:
-            fail_once = _bridge_fail_once_error(
-                response_text, tool_calls, hermes_names
-            )
-            if fail_once:
-                tool_calls = []
-                cleaned_text = fail_once
+            tool_calls = _select_hermes_tool_calls(tool_calls, hermes_names)
 
         usage = SimpleNamespace(
             prompt_tokens=0,

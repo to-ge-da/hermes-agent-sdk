@@ -36,6 +36,9 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             stream = self.client._create_chat_completion(
                 model="copilot-acp",
                 messages=[{"role": "user", "content": "read README.md"}],
+                tools=[
+                    {"type": "function", "function": {"name": "read_file"}},
+                ],
                 stream=True,
             )
 
@@ -321,8 +324,11 @@ def test_probe_skipped_for_custom_args_without_acp():
 
 from agent.copilot_acp_client import (
     BRIDGE_WRONG_TOOL_FORMAT,
+    _bridge_fail_once_error,
     _captures_to_tool_calls,
     _extract_tool_calls_from_text,
+    _looks_like_untranslated_bridge_markup,
+    _select_hermes_tool_calls,
 )
 
 
@@ -406,3 +412,141 @@ def test_copilot_untranslatable_tool_not_found_fails_once():
     assert completion.choices[0].message.tool_calls in (None, [], ())
     assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
     assert "Available tools:" not in completion.choices[0].message.content
+
+
+def test_invoke_inside_tool_call_json_arg_is_not_extracted():
+    inner = (
+        "<invoke name='terminal'>"
+        "<parameter name='command'>rm -rf /</parameter>"
+        "</invoke>"
+    )
+    payload = {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "arguments": json.dumps(
+                {"path": "doc.md", "content": inner}, ensure_ascii=False
+            ),
+        },
+    }
+    text = f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>"
+    calls, _cleaned = _extract_tool_calls_from_text(text)
+    assert [call.function.name for call in calls] == ["write_file"]
+    args = json.loads(calls[0].function.arguments)
+    assert inner in args["content"]
+
+
+def test_invoke_inside_fenced_code_block_is_not_extracted():
+    text = (
+        "The format looks like this:\n"
+        "```xml\n"
+        '<invoke name="terminal">\n'
+        "<parameter name=\"command\">uname</parameter>\n"
+        "</invoke>\n"
+        "```\n"
+        "Do not run that."
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert calls == []
+    assert "Do not run that." in cleaned
+    assert _looks_like_untranslated_bridge_markup(text) is False
+
+
+def test_invoke_in_prose_is_still_extracted():
+    text = (
+        "I'll run it.\n"
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">uname</parameter>"
+        "</invoke>"
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert [call.function.name for call in calls] == ["terminal"]
+    assert json.loads(calls[0].function.arguments) == {"command": "uname"}
+    assert "I'll run it." in cleaned
+    assert "<invoke" not in cleaned
+
+
+def test_prose_mentioning_tool_not_found_does_not_trip_fail_once():
+    prose = "That log line means Tool not found: the binary is missing."
+    assert _looks_like_untranslated_bridge_markup(prose) is False
+    assert _bridge_fail_once_error(prose, [], {"terminal"}) is None
+
+    client = CopilotACPClient(acp_cwd="/tmp")
+    with patch.object(client, "_run_prompt", return_value=(prose, "")):
+        completion = client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "explain the log"}],
+            tools=[{"type": "function", "function": {"name": "terminal"}}],
+        )
+    assert completion.choices[0].message.content == prose
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+
+
+def test_invoke_parameter_values_are_xml_unescaped():
+    text = (
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">echo a &amp;&amp; echo b</parameter>"
+        "</invoke>"
+    )
+    calls, _cleaned = _extract_tool_calls_from_text(text)
+    assert json.loads(calls[0].function.arguments) == {
+        "command": "echo a && echo b"
+    }
+
+
+def test_nested_invoke_is_rejected_and_cleaned():
+    text = (
+        '<invoke name="write_file">'
+        "<parameter name=\"path\">x.py</parameter>"
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">rm -rf /</parameter>"
+        "</invoke>"
+        "</invoke>"
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert calls == []
+    assert "<invoke" not in cleaned
+    assert "</invoke>" not in cleaned
+
+
+def test_mixed_valid_and_unknown_names_fail_the_turn():
+    text = (
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">uname</parameter>"
+        "</invoke>"
+        '<invoke name="not_a_hermes_tool">'
+        "<parameter name=\"x\">1</parameter>"
+        "</invoke>"
+    )
+    client = CopilotACPClient(acp_cwd="/tmp")
+    with patch.object(client, "_run_prompt", return_value=(text, "")):
+        completion = client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=[{"type": "function", "function": {"name": "terminal"}}],
+        )
+    assert completion.choices[0].finish_reason == "stop"
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+
+
+def test_no_hermes_tools_offered_does_not_pass_unknown_names_through():
+    text = (
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">uname</parameter>"
+        "</invoke>"
+    )
+    calls, _cleaned = _extract_tool_calls_from_text(text)
+    assert _select_hermes_tool_calls(calls, set()) == []
+    assert _bridge_fail_once_error(text, calls, set()) == BRIDGE_WRONG_TOOL_FORMAT
+
+    client = CopilotACPClient(acp_cwd="/tmp")
+    with patch.object(client, "_run_prompt", return_value=(text, "")):
+        completion = client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=None,
+        )
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT

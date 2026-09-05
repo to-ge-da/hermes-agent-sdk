@@ -1185,7 +1185,7 @@ def test_run_turn_registers_custom_tools_deferral_shim_and_keeps_builtins_off():
     class _Agent:
         def send(self, _msg):
             custom = captured_options["local"]["custom_tools"]
-            assert captured_options["tools"] == []
+            assert captured_options["tools"] == ["mcp"]
             assert captured_options["mcp_servers"] == {}
             assert "terminal" in custom
             defer = custom["terminal"]["execute"](
@@ -1260,3 +1260,177 @@ def test_untranslatable_markup_drops_agent_so_next_turn_is_not_resume(tmp_path, 
         )
     assert second.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
     assert creates["n"] == 2
+
+
+def test_prose_tool_not_found_does_not_drop_cursor_agent(tmp_path, monkeypatch):
+    from agent import cursor_sdk_client as mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    creates = {"n": 0}
+    prose = "That log line means Tool not found: the binary is missing."
+
+    class _Agent:
+        def send(self, _msg):
+            return SimpleNamespace(
+                text=prose,
+                wait=lambda: SimpleNamespace(result=prose, status="finished"),
+                cancel=lambda: None,
+            )
+
+    def _create(**_k):
+        creates["n"] += 1
+        return _Agent()
+
+    first_messages = [{"role": "user", "content": "explain the log"}]
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        first = client.chat.completions.create(
+            model="grok-4.6",
+            messages=first_messages,
+            tools=_TERMINAL_TOOLS,
+        )
+        assert first.choices[0].message.content == prose
+        assert first.choices[0].message.tool_calls in (None, [], ())
+        slot = client._slot_key("grok-4.6")
+        rec = mod._slots.get(slot)
+        assert rec is not None and rec.get("agent") is not None
+        second = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[
+                *first_messages,
+                {"role": "assistant", "content": prose},
+                {"role": "user", "content": "thanks"},
+            ],
+            tools=_TERMINAL_TOOLS,
+        )
+    assert second.choices[0].message.content == prose
+    assert creates["n"] == 1
+
+
+def test_finish_turn_dedups_bucket_and_run_events():
+    from agent import cursor_sdk_client as mod
+    from agent.copilot_acp_client import _CUSTOM_TOOL_DEFERRAL, _captures_to_tool_calls
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    captured_options: dict = {}
+    event = SimpleNamespace(
+        type="tool_call",
+        name="terminal",
+        args={"command": "uname"},
+        tool_call_id="c1",
+    )
+
+    class _Agent:
+        def send(self, _msg):
+            custom = captured_options["local"]["custom_tools"]
+            custom["terminal"]["execute"](
+                {"command": "uname"}, SimpleNamespace(tool_call_id="c1")
+            )
+            return SimpleNamespace(
+                text=_CUSTOM_TOOL_DEFERRAL,
+                wait=lambda: SimpleNamespace(
+                    result=_CUSTOM_TOOL_DEFERRAL, status="finished"
+                ),
+                cancel=lambda: None,
+                conversation=lambda: [event],
+                tool_calls=[event],
+            )
+
+    def _create(**kwargs):
+        captured_options.update(kwargs.get("options") or {})
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        client._run_turn(
+            "hi",
+            model="grok-4.6",
+            resume=False,
+            tools=_TERMINAL_TOOLS,
+        )
+        calls, _cleaned = client._tool_calls_after_turn(
+            "", tools=_TERMINAL_TOOLS, model_id="grok-4.6"
+        )
+    assert len(client._last_captures) == 1
+    converted = _captures_to_tool_calls(client._last_captures)
+    ids = [call.id for call in converted]
+    assert len(ids) == len(set(ids))
+    assert [call.id for call in calls] == ["c1"]
+
+
+def test_run_turn_raises_on_error_status_even_when_captures_exist():
+    from agent import cursor_sdk_client as mod
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    captured_options: dict = {}
+
+    class _Agent:
+        def send(self, _msg):
+            custom = captured_options["local"]["custom_tools"]
+            custom["terminal"]["execute"](
+                {"command": "uname"}, SimpleNamespace(tool_call_id="c1")
+            )
+            return SimpleNamespace(
+                text="",
+                wait=lambda: SimpleNamespace(
+                    result=None, status="error", error="boom"
+                ),
+                cancel=lambda: None,
+            )
+
+    def _create(**kwargs):
+        captured_options.update(kwargs.get("options") or {})
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        with pytest.raises(RuntimeError, match="boom"):
+            client._run_turn(
+                "hi",
+                model="grok-4.6",
+                resume=False,
+                tools=_TERMINAL_TOOLS,
+            )
+
+
+def test_iter_sdk_tool_calls_does_not_drain_callable_messages_or_cycles():
+    from agent.cursor_sdk_client import _iter_sdk_tool_calls
+
+    drained = {"n": 0}
+
+    class _Run:
+        def messages(self):
+            drained["n"] += 1
+            yield SimpleNamespace(type="tool_call", name="terminal", args={})
+
+    assert _iter_sdk_tool_calls(_Run()) == []
+    assert drained["n"] == 0
+
+    first: dict = {"type": "other"}
+    second: dict = {"type": "other", "message": first}
+    first["message"] = second
+    assert _iter_sdk_tool_calls(first) == []
+
+
+def test_cursor_aux_path_without_tools_fails_once_on_invoke():
+    from agent.copilot_acp_client import BRIDGE_WRONG_TOOL_FORMAT
+
+    client = CursorSDKClient(api_key="crsr_test")
+    xml = (
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">uname</parameter>"
+        "</invoke>"
+    )
+    with patch.object(client, "_run_turn", return_value=xml):
+        completion = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=None,
+        )
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT

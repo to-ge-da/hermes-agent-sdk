@@ -6,8 +6,15 @@ real JSON schema, the model emits <tool_call> JSON, and Hermes executes it —
 same shape as Copilot ACP, without ACP wording (that makes Cursor walk the
 repo with its own tools).
 
-Cursor-native tools stay off (tools=[], mcp_servers={}). That is not a Hermes
-allowlist; it is "do not give Cursor a second filesystem."
+Cursor-native tools stay off (tools=["mcp"], mcp_servers={}). That is not a
+Hermes allowlist; it is "do not give Cursor a second filesystem."
+`tools=[]` is documented as "no built-in tools; the model can only respond
+with text", and deny-wins requires a tool to be in `tools` when that field
+is set. Custom tools ride the built-in `custom-user-tools` MCP server, so
+omitting the `mcp` group hides Hermes `local.custom_tools` and Part 1
+captures never fire. `tools=["mcp"]` + empty `mcp_servers` exposes ONLY
+those Hermes names. Assumption per cursor.com/docs/sdk/python — a live
+Cursor-hosted session test is still required before merge.
 
 A live Agent is reused across turns in this process. Cold start sends a
 windowed transcript; later turns send only the latest user line plus any
@@ -41,6 +48,7 @@ from agent.copilot_acp_client import (
     _hermes_tool_names,
     _looks_like_untranslated_bridge_markup,
     _select_hermes_tool_calls,
+    _unknown_bridge_tool_names,
 )
 from hermes_constants import display_hermes_home
 
@@ -718,22 +726,44 @@ def _hermes_custom_tools(
     return custom
 
 
-def _iter_sdk_tool_calls(source: Any) -> list[tuple[str, Any, str | None]]:
+_MAX_SDK_TOOL_WALK = 32
+
+
+def _iter_sdk_tool_calls(
+    source: Any,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> list[tuple[str, Any, str | None]]:
+    """Walk a materialized conversation snapshot for tool_call events.
+
+    Does not drain ``run.messages()`` (a live generator). Only sequences
+    already in memory are walked, with a depth/identity bound so cycles
+    cannot rely on the caller's ``except`` to terminate.
+    """
     out: list[tuple[str, Any, str | None]] = []
     if source is None or isinstance(source, (str, bytes, bytearray)):
         return out
+    if _depth > _MAX_SDK_TOOL_WALK:
+        return out
+    seen = _seen if _seen is not None else set()
+    ident = id(source)
+    if ident in seen:
+        return out
+    seen.add(ident)
     if isinstance(source, dict):
         items: list[Any] = [source]
     elif isinstance(source, (list, tuple)):
         items = list(source)
     else:
         messages = getattr(source, "messages", None)
-        if messages is not None and messages is not source:
-            return _iter_sdk_tool_calls(messages)
-        try:
-            items = list(source)
-        except TypeError:
-            items = [source]
+        if callable(messages):
+            messages = None
+        if isinstance(messages, (list, tuple)) and messages is not source:
+            return _iter_sdk_tool_calls(
+                messages, _depth=_depth + 1, _seen=seen
+            )
+        items = [source]
     for msg in items:
         if msg is None or msg is source:
             continue
@@ -764,22 +794,40 @@ def _iter_sdk_tool_calls(source: Any) -> list[tuple[str, Any, str | None]]:
                 )
             continue
         if nested is not None and nested is not msg:
-            out.extend(_iter_sdk_tool_calls(nested))
+            out.extend(
+                _iter_sdk_tool_calls(nested, _depth=_depth + 1, _seen=seen)
+            )
+    return out
+
+
+def _tool_event_dedup_key(item: tuple[str, Any, str | None]) -> tuple[Any, ...]:
+    return (item[0], json.dumps(item[1], sort_keys=True, default=str), item[2])
+
+
+def _dedup_tool_events(
+    items: list[tuple[str, Any, str | None]],
+) -> list[tuple[str, Any, str | None]]:
+    seen: set[tuple[Any, ...]] = set()
+    out: list[tuple[str, Any, str | None]] = []
+    for item in items:
+        key = _tool_event_dedup_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
     return out
 
 
 def _collect_run_tool_events(*sources: Any) -> list[tuple[str, Any, str | None]]:
-    """Best-effort tool_call events after wait(). Do not drain run.messages()."""
+    """Best-effort tool_call events after wait().
+
+    Walks ``conversation()`` snapshots and ``tool_calls`` / ``tool_events``.
+    Does not call ``run.messages()`` — that generator is a live drain.
+    """
     out: list[tuple[str, Any, str | None]] = []
-    seen: set[tuple[Any, ...]] = set()
 
     def _add(items: list[tuple[str, Any, str | None]]) -> None:
-        for item in items:
-            key = (item[0], json.dumps(item[1], sort_keys=True, default=str), item[2])
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(item)
+        out.extend(items)
 
     for source in sources:
         if source is None:
@@ -794,7 +842,7 @@ def _collect_run_tool_events(*sources: Any) -> list[tuple[str, Any, str | None]]
             val = getattr(source, attr, None)
             if val:
                 _add(_iter_sdk_tool_calls(val))
-    return out
+    return _dedup_tool_events(out)
 
 
 def format_hermes_cursor_prompt(
@@ -1269,18 +1317,23 @@ class CursorSDKClient:
     ) -> tuple[list[Any], str]:
         hermes_names = _hermes_tool_names(tools)
         captured = _captures_to_tool_calls(self._last_captures)
-        matched = _select_hermes_tool_calls(captured, hermes_names)
-        if matched:
-            return matched, ""
+        if captured:
+            fail = _bridge_fail_once_error(response_text, captured, hermes_names)
+            if fail and _unknown_bridge_tool_names(captured, hermes_names):
+                self._abandon_slot(model_id)
+                return [], fail
+            matched = _select_hermes_tool_calls(captured, hermes_names)
+            if matched:
+                return matched, ""
         extracted, cleaned = _extract_tool_calls_from_text(response_text)
-        matched = _select_hermes_tool_calls(extracted, hermes_names)
-        if matched:
-            return matched, cleaned
         fail = _bridge_fail_once_error(response_text, extracted, hermes_names)
         if fail:
             self._abandon_slot(model_id)
             return [], fail
-        return extracted, cleaned
+        matched = _select_hermes_tool_calls(extracted, hermes_names)
+        if matched:
+            return matched, cleaned
+        return [], cleaned
 
     def _run_prompt(self, prompt_text: str, *, model: str) -> str:
         """Test hook / oneshot path: one Agent.prompt, no session cache."""
@@ -1334,6 +1387,17 @@ class CursorSDKClient:
         self._last_captures = []
 
         def _options_for(bucket: list[Any]) -> dict[str, Any]:
+            # Documented cursor-sdk semantics (cursor.com/docs/sdk/python):
+            # `tools=[]` offers no built-in tools and the model can only
+            # respond with text. Deny wins: when `tools` is set, a tool must
+            # be listed. Custom tools ride the built-in `custom-user-tools`
+            # MCP server and are gated by the `mcp` capability group —
+            # omitting `mcp` hides Hermes `local.custom_tools`, so Part 1
+            # captures never fire. `tools=["mcp"]` + `mcp_servers={}`
+            # exposes ONLY those Hermes custom tools; Cursor shell/read/edit
+            # stay off.
+            # Assumption not live-verified in this change — a Cursor-hosted
+            # session test is still required before merge.
             return {
                 "model": selection,
                 "api_key": self.api_key,
@@ -1342,12 +1406,14 @@ class CursorSDKClient:
                     "custom_tools": _hermes_custom_tools(tools, bucket),
                 },
                 "mcp_servers": {},
-                "tools": [],
+                "tools": ["mcp"],
             }
 
         def _finish_turn(text: str, *sources: Any, bucket: list[Any]) -> str:
             events = _collect_run_tool_events(*sources) if sources else []
-            self._last_captures = list(bucket) + events
+            self._last_captures = _dedup_tool_events(list(bucket) + events)
+            if sources:
+                _raise_for_failed_run(*sources)
             if self._last_captures:
                 return text if text.strip() else _CUSTOM_TOOL_DEFERRAL
             detail = _run_failure_detail(*sources) if sources else ""
@@ -1356,8 +1422,6 @@ class CursorSDKClient:
             )
             if _looks_like_untranslated_bridge_markup(combined):
                 return combined
-            if sources:
-                _raise_for_failed_run(*sources)
             return text
 
         if oneshot:
