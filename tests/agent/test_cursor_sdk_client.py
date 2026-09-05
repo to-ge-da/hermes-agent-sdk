@@ -1094,3 +1094,169 @@ def test_create_openai_client_live_session_id_survives_init_order_and_new(monkey
     agent_a.session_id = "session-a-after-new"
     assert client_a._slot_key("grok-4.6").startswith("session-a-after-new::")
     assert client_b._slot_key("grok-4.6").startswith("session-b::")
+
+
+_TERMINAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "run a command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }
+]
+
+
+def test_cursor_client_maps_invoke_xml_to_hermes_tool_calls():
+    client = CursorSDKClient(api_key="crsr_test")
+    xml = (
+        '<function_calls>\n'
+        '<invoke name="terminal">\n'
+        "<parameter name=\"command\">uname</parameter>\n"
+        "</invoke>\n"
+        "</function_calls>"
+    )
+    with patch.object(client, "_run_turn", return_value=xml) as run:
+        completion = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=_TERMINAL_TOOLS,
+        )
+    assert run.call_count == 1
+    assert completion.choices[0].finish_reason == "tool_calls"
+    call = completion.choices[0].message.tool_calls[0]
+    assert call.function.name == "terminal"
+    assert json.loads(call.function.arguments) == {"command": "uname"}
+
+
+def test_cursor_custom_tools_capture_becomes_hermes_tool_calls():
+    client = CursorSDKClient(api_key="crsr_test")
+
+    def _run(*_a, **_k):
+        client._last_captures = [("terminal", {"command": "uname"}, "call_x")]
+        return ""
+
+    with patch.object(client, "_run_turn", side_effect=_run) as run:
+        completion = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=_TERMINAL_TOOLS,
+        )
+    assert run.call_count == 1
+    assert completion.choices[0].finish_reason == "tool_calls"
+    call = completion.choices[0].message.tool_calls[0]
+    assert call.function.name == "terminal"
+    assert call.id == "call_x"
+    assert json.loads(call.function.arguments) == {"command": "uname"}
+
+
+def test_untranslatable_tool_not_found_fails_once_without_second_run_turn():
+    from agent.copilot_acp_client import BRIDGE_WRONG_TOOL_FORMAT
+
+    client = CursorSDKClient(api_key="crsr_test")
+    not_found = "Tool not found: mystery_tool\nAvailable tools:"
+    with patch.object(client, "_run_turn", return_value=not_found) as run:
+        completion = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=_TERMINAL_TOOLS,
+        )
+    assert run.call_count == 1
+    assert completion.choices[0].finish_reason == "stop"
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+    content = completion.choices[0].message.content
+    assert content == BRIDGE_WRONG_TOOL_FORMAT
+    assert "Available tools:" not in content
+
+
+def test_run_turn_registers_custom_tools_deferral_shim_and_keeps_builtins_off():
+    from agent import cursor_sdk_client as mod
+    from agent.copilot_acp_client import _CUSTOM_TOOL_DEFERRAL
+
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    captured_options: dict = {}
+
+    class _Agent:
+        def send(self, _msg):
+            custom = captured_options["local"]["custom_tools"]
+            assert captured_options["tools"] == []
+            assert captured_options["mcp_servers"] == {}
+            assert "terminal" in custom
+            defer = custom["terminal"]["execute"](
+                {"command": "uname"}, SimpleNamespace(tool_call_id="c1")
+            )
+            assert defer == _CUSTOM_TOOL_DEFERRAL
+            return SimpleNamespace(
+                text=_CUSTOM_TOOL_DEFERRAL,
+                wait=lambda: SimpleNamespace(
+                    result=_CUSTOM_TOOL_DEFERRAL, status="finished"
+                ),
+                cancel=lambda: None,
+            )
+
+    def _create(**kwargs):
+        captured_options.update(kwargs.get("options") or {})
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        text = client._run_turn(
+            "hi",
+            model="grok-4.6",
+            resume=False,
+            tools=_TERMINAL_TOOLS,
+        )
+    assert text == _CUSTOM_TOOL_DEFERRAL
+    assert client._last_captures[0][0] == "terminal"
+    assert client._last_captures[0][1] == {"command": "uname"}
+    assert client._last_captures[0][2] == "c1"
+
+
+def test_untranslatable_markup_drops_agent_so_next_turn_is_not_resume(tmp_path, monkeypatch):
+    from agent import cursor_sdk_client as mod
+    from agent.copilot_acp_client import BRIDGE_WRONG_TOOL_FORMAT
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    mod._slots.clear()
+    client = CursorSDKClient(api_key="crsr_test")
+    creates = {"n": 0}
+    not_found = "Tool not found: terminal\nAvailable tools:"
+
+    class _Agent:
+        def send(self, _msg):
+            return SimpleNamespace(
+                text=not_found,
+                wait=lambda: SimpleNamespace(result=not_found, status="finished"),
+                cancel=lambda: None,
+            )
+
+    def _create(**_k):
+        creates["n"] += 1
+        return _Agent()
+
+    fake = SimpleNamespace(create=_create, prompt=lambda *a, **k: None)
+    with patch.dict("sys.modules", {"cursor_sdk": SimpleNamespace(Agent=fake)}):
+        first = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=_TERMINAL_TOOLS,
+        )
+        assert first.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+        assert creates["n"] == 1
+        slot = client._slot_key("grok-4.6")
+        rec = mod._slots.get(slot)
+        assert rec is None or rec.get("agent") is None
+        second = client.chat.completions.create(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "uname again"}],
+            tools=_TERMINAL_TOOLS,
+        )
+    assert second.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+    assert creates["n"] == 2

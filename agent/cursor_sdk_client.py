@@ -33,7 +33,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.copilot_acp_client import _extract_tool_calls_from_text
+from agent.copilot_acp_client import (
+    _CUSTOM_TOOL_DEFERRAL,
+    _bridge_fail_once_error,
+    _captures_to_tool_calls,
+    _extract_tool_calls_from_text,
+    _hermes_tool_names,
+    _looks_like_untranslated_bridge_markup,
+    _select_hermes_tool_calls,
+)
 from hermes_constants import display_hermes_home
 
 log = logging.getLogger(__name__)
@@ -685,6 +693,110 @@ def hermes_tools_spec(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]
     return specs
 
 
+def _hermes_custom_tools(
+    tools: list[dict[str, Any]] | None,
+    bucket: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """Allowlist Hermes names as Cursor local.custom_tools; do not execute."""
+    custom: dict[str, dict[str, Any]] = {}
+    for spec in hermes_tools_spec(tools):
+        name = spec["name"]
+
+        def _execute(args: Any, context: Any = None, *, _name: str = name) -> str:
+            call_id = None
+            if context is not None:
+                call_id = getattr(context, "tool_call_id", None)
+            bucket.append((_name, args, call_id))
+            return _CUSTOM_TOOL_DEFERRAL
+
+        custom[name] = {
+            "description": spec.get("description") or "",
+            "input_schema": spec.get("parameters")
+            or {"type": "object", "properties": {}},
+            "execute": _execute,
+        }
+    return custom
+
+
+def _iter_sdk_tool_calls(source: Any) -> list[tuple[str, Any, str | None]]:
+    out: list[tuple[str, Any, str | None]] = []
+    if source is None or isinstance(source, (str, bytes, bytearray)):
+        return out
+    if isinstance(source, dict):
+        items: list[Any] = [source]
+    elif isinstance(source, (list, tuple)):
+        items = list(source)
+    else:
+        messages = getattr(source, "messages", None)
+        if messages is not None and messages is not source:
+            return _iter_sdk_tool_calls(messages)
+        try:
+            items = list(source)
+        except TypeError:
+            items = [source]
+    for msg in items:
+        if msg is None or msg is source:
+            continue
+        if isinstance(msg, dict):
+            mtype = msg.get("type")
+            name = msg.get("name")
+            args = msg.get("args", msg.get("arguments"))
+            call_id = msg.get("call_id") or msg.get("tool_call_id") or msg.get("id")
+            nested = msg.get("message")
+        else:
+            mtype = getattr(msg, "type", None)
+            name = getattr(msg, "name", None)
+            args = getattr(msg, "args", None)
+            if args is None:
+                args = getattr(msg, "arguments", None)
+            call_id = getattr(msg, "call_id", None) or getattr(
+                msg, "tool_call_id", None
+            )
+            nested = getattr(msg, "message", None)
+        if str(mtype or "").lower() in {"tool_call", "tooluse", "tool_use"}:
+            if isinstance(name, str) and name.strip():
+                out.append(
+                    (
+                        name.strip(),
+                        args,
+                        call_id if isinstance(call_id, str) else None,
+                    )
+                )
+            continue
+        if nested is not None and nested is not msg:
+            out.extend(_iter_sdk_tool_calls(nested))
+    return out
+
+
+def _collect_run_tool_events(*sources: Any) -> list[tuple[str, Any, str | None]]:
+    """Best-effort tool_call events after wait(). Do not drain run.messages()."""
+    out: list[tuple[str, Any, str | None]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def _add(items: list[tuple[str, Any, str | None]]) -> None:
+        for item in items:
+            key = (item[0], json.dumps(item[1], sort_keys=True, default=str), item[2])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+
+    for source in sources:
+        if source is None:
+            continue
+        conv = getattr(source, "conversation", None)
+        if callable(conv):
+            try:
+                _add(_iter_sdk_tool_calls(conv()))
+            except Exception:
+                pass
+        for attr in ("tool_calls", "tool_events"):
+            val = getattr(source, attr, None)
+            if val:
+                _add(_iter_sdk_tool_calls(val))
+    return out
+
+
 def format_hermes_cursor_prompt(
     messages: list[dict[str, Any]],
     *,
@@ -952,6 +1064,7 @@ class CursorSDKClient:
         self.chat = _CursorChatNamespace(self)
         self.is_closed = False
         self._last_usage: Any = None
+        self._last_captures: list[Any] = []
 
     def close(self) -> None:
         self.is_closed = True
@@ -1085,7 +1198,12 @@ class CursorSDKClient:
             )
         try:
             response_text = self._run_turn(
-                prompt_text, model=model_id, resume=resume, images=images, slot=slot
+                prompt_text,
+                model=model_id,
+                resume=resume,
+                images=images,
+                slot=slot,
+                tools=tools,
             )
         except _ColdStartRequired:
             # The live agent could not take the delta, so the replacement
@@ -1100,9 +1218,16 @@ class CursorSDKClient:
             )
             images = self._turn_images(rec, messages or [], resume=False)
             response_text = self._run_turn(
-                prompt_text, model=model_id, resume=False, images=images, slot=slot
+                prompt_text,
+                model=model_id,
+                resume=False,
+                images=images,
+                slot=slot,
+                tools=tools,
             )
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        tool_calls, cleaned_text = self._tool_calls_after_turn(
+            response_text, tools=tools, model_id=model_id
+        )
         usage = _openai_usage_from_cursor(self._last_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
@@ -1125,6 +1250,38 @@ class CursorSDKClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
+    def _abandon_slot(self, model: str) -> None:
+        """Drop the live Agent so the next turn does not resume poisoned markup."""
+        slot = self._slot_key(model)
+        with _slots_guard:
+            rec = _slots.get(slot)
+        if rec is None:
+            return
+        with rec["lock"]:
+            _drop_agent(rec)
+
+    def _tool_calls_after_turn(
+        self,
+        response_text: str,
+        *,
+        tools: list[dict[str, Any]] | None,
+        model_id: str,
+    ) -> tuple[list[Any], str]:
+        hermes_names = _hermes_tool_names(tools)
+        captured = _captures_to_tool_calls(self._last_captures)
+        matched = _select_hermes_tool_calls(captured, hermes_names)
+        if matched:
+            return matched, ""
+        extracted, cleaned = _extract_tool_calls_from_text(response_text)
+        matched = _select_hermes_tool_calls(extracted, hermes_names)
+        if matched:
+            return matched, cleaned
+        fail = _bridge_fail_once_error(response_text, extracted, hermes_names)
+        if fail:
+            self._abandon_slot(model_id)
+            return [], fail
+        return extracted, cleaned
+
     def _run_prompt(self, prompt_text: str, *, model: str) -> str:
         """Test hook / oneshot path: one Agent.prompt, no session cache."""
         return self._run_turn(prompt_text, model=model, resume=False, oneshot=True)
@@ -1138,6 +1295,7 @@ class CursorSDKClient:
         oneshot: bool = False,
         images: list[dict[str, Any]] | None = None,
         slot: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         if not self.api_key:
             raise CursorSDKError(
@@ -1170,17 +1328,41 @@ class CursorSDKClient:
             cwd = str(Path.cwd().resolve())
 
         selection = cursor_sdk_model(model)
-        options = {
-            "model": selection,
-            "api_key": self.api_key,
-            "local": {"cwd": cwd},
-            "mcp_servers": {},
-            "tools": [],
-        }
         log.debug("Cursor model selection: %s", json.dumps(selection, sort_keys=True))
 
         self._last_usage = None
+        self._last_captures = []
+
+        def _options_for(bucket: list[Any]) -> dict[str, Any]:
+            return {
+                "model": selection,
+                "api_key": self.api_key,
+                "local": {
+                    "cwd": cwd,
+                    "custom_tools": _hermes_custom_tools(tools, bucket),
+                },
+                "mcp_servers": {},
+                "tools": [],
+            }
+
+        def _finish_turn(text: str, *sources: Any, bucket: list[Any]) -> str:
+            events = _collect_run_tool_events(*sources) if sources else []
+            self._last_captures = list(bucket) + events
+            if self._last_captures:
+                return text if text.strip() else _CUSTOM_TOOL_DEFERRAL
+            detail = _run_failure_detail(*sources) if sources else ""
+            combined = "\n".join(
+                part for part in (text, detail) if part and str(part).strip()
+            )
+            if _looks_like_untranslated_bridge_markup(combined):
+                return combined
+            if sources:
+                _raise_for_failed_run(*sources)
+            return text
+
         if oneshot:
+            capture_bucket: list[Any] = []
+            options = _options_for(capture_bucket)
             try:
                 result = Agent.prompt(
                     _cursor_user_message(prompt_text, images), options=options
@@ -1188,17 +1370,22 @@ class CursorSDKClient:
             except Exception as exc:
                 raise cursor_sdk_error(exc, phase="prompt") from exc
             self._last_usage = _cursor_token_usage(result)
-            _raise_for_failed_run(result)
             text = getattr(result, "result", None)
-            if isinstance(text, str):
-                return text
-            return "" if text is None else str(text)
+            if not isinstance(text, str):
+                text = "" if text is None else str(text)
+            return _finish_turn(text, result, bucket=capture_bucket)
 
         slot = slot or self._slot_key(model)
         rec = _slot_record(slot)
         _evict_idle_slots(slot)
         run = None
         with rec["lock"]:
+            bucket = rec.get("captures")
+            if not isinstance(bucket, list):
+                bucket = []
+                rec["captures"] = bucket
+            bucket.clear()
+            options = _options_for(bucket)
             _cancel_run(rec)
             try:
                 if rec.get("agent") is None:
@@ -1230,8 +1417,12 @@ class CursorSDKClient:
                 except Exception as exc:
                     raise cursor_sdk_error(exc, phase="run") from exc
             self._last_usage = _cursor_token_usage(waited) or _cursor_token_usage(run)
-            _raise_for_failed_run(waited, run)
             text = _run_text(run, waited)
+            text = _finish_turn(text, waited, run, bucket=bucket)
+            if self._last_captures:
+                return text
+            if _looks_like_untranslated_bridge_markup(text):
+                return text
             if not text.strip():
                 # A silent turn reads as a hung Hermes. Drop the agent so the
                 # retry cold-starts with the full window instead of a delta

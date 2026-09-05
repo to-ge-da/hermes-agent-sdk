@@ -35,6 +35,30 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
+_INVOKE_BLOCK_RE = re.compile(
+    r"<invoke\s+[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PARAMETER_RE = re.compile(
+    r"<parameter\s+[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+_FUNCTION_CALLS_RE = re.compile(
+    r"<function_calls\b[^>]*>.*?</function_calls>",
+    re.DOTALL | re.IGNORECASE,
+)
+_UNTRANSLATED_MARKUP_RE = re.compile(
+    r"<invoke\b|<parameter\b|<function_calls\b|tool not found",
+    re.IGNORECASE,
+)
+
+# Fail-once copy for bridge XML / empty-allowlist rejects. Keep it terse —
+# dumping the tool catalog here primes the same retry loop (#47967).
+BRIDGE_WRONG_TOOL_FORMAT = (
+    "wrong tool format; use Hermes <tool_call> JSON or a listed tool; "
+    "do not retry this payload"
+)
+_CUSTOM_TOOL_DEFERRAL = "Hermes will execute this; do not retry"
 
 # Stderr fingerprint of the deprecated `gh copilot` CLI extension
 # (https://github.blog/changelog/2025-09-25-upcoming-deprecation-of-gh-copilot-cli-extension).
@@ -349,6 +373,167 @@ def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleName
     return [data_chunk, usage_chunk]
 
 
+def _parameter_value(raw: str) -> Any:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text[:1] in "{[":
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return text
+
+
+def _try_parse_openai_tool_json(raw_json: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(raw_json)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function")
+    if not isinstance(fn, dict):
+        return None
+    fn_name = fn.get("name")
+    if not isinstance(fn_name, str) or not fn_name.strip():
+        return None
+    fn_args = fn.get("arguments", "{}")
+    if not isinstance(fn_args, str):
+        fn_args = json.dumps(fn_args, ensure_ascii=False)
+    call_id = obj.get("id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = ""
+    return {
+        "name": fn_name.strip(),
+        "arguments": fn_args,
+        "id": call_id,
+    }
+
+
+def _extract_invoke_xml_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
+    found: list[tuple[int, int, dict[str, Any]]] = []
+    for match in _INVOKE_BLOCK_RE.finditer(text):
+        name = (match.group(1) or "").strip()
+        if not name:
+            continue
+        body = match.group(2) or ""
+        args: dict[str, Any] = {}
+        for param in _PARAMETER_RE.finditer(body):
+            key = (param.group(1) or "").strip()
+            if not key:
+                continue
+            args[key] = _parameter_value(param.group(2) or "")
+        found.append(
+            (
+                match.start(),
+                match.end(),
+                {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                    "id": "",
+                },
+            )
+        )
+    return found
+
+
+def _hermes_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") or {}
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _captures_to_tool_calls(
+    captures: list[Any] | None,
+) -> list[ChatCompletionMessageToolCall]:
+    """Turn custom_tools / run-event captures into OpenAI tool_calls."""
+    extracted: list[ChatCompletionMessageToolCall] = []
+    if not captures:
+        return extracted
+    for index, item in enumerate(captures):
+        name: Any = None
+        args: Any = None
+        call_id: Any = None
+        if isinstance(item, dict):
+            name = item.get("name")
+            args = item.get("args", item.get("arguments"))
+            call_id = item.get("tool_call_id", item.get("call_id", item.get("id")))
+        elif isinstance(item, (tuple, list)) and item:
+            name = item[0]
+            args = item[1] if len(item) > 1 else None
+            call_id = item[2] if len(item) > 2 else None
+        else:
+            name = getattr(item, "name", None)
+            args = getattr(item, "args", None)
+            if args is None:
+                args = getattr(item, "arguments", None)
+            call_id = getattr(item, "tool_call_id", None) or getattr(
+                item, "call_id", None
+            )
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if isinstance(args, str):
+            fn_args = args
+        else:
+            fn_args = json.dumps(args if args is not None else {}, ensure_ascii=False)
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = f"bridge_call_{index + 1}"
+        extracted.append(
+            _build_openai_tool_call(
+                call_id=call_id,
+                name=name.strip(),
+                arguments=fn_args,
+            )
+        )
+    return extracted
+
+
+def _select_hermes_tool_calls(
+    calls: list[ChatCompletionMessageToolCall],
+    hermes_names: set[str] | None,
+) -> list[ChatCompletionMessageToolCall]:
+    if not calls:
+        return []
+    if not hermes_names:
+        return list(calls)
+    matched = [call for call in calls if call.function.name in hermes_names]
+    return matched
+
+
+def _looks_like_untranslated_bridge_markup(text: str) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_UNTRANSLATED_MARKUP_RE.search(text))
+
+
+def _bridge_fail_once_error(
+    text: str,
+    tool_calls: list[ChatCompletionMessageToolCall] | None = None,
+    hermes_names: set[str] | None = None,
+) -> str | None:
+    """One error when invoke/XML or 'Tool not found' cannot map to a Hermes tool.
+
+    Returns None when a Hermes-named call was produced, or when the text is
+    ordinary assistant output. Does not include the tool catalog.
+    """
+    if _select_hermes_tool_calls(tool_calls or [], hermes_names):
+        return None
+    if not _looks_like_untranslated_bridge_markup(text or ""):
+        return None
+    return BRIDGE_WRONG_TOOL_FORMAT
+
+
 def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
     if not isinstance(text, str) or not text.strip():
         return [], ""
@@ -356,33 +541,22 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
     extracted: list[ChatCompletionMessageToolCall] = []
     consumed_spans: list[tuple[int, int]] = []
 
-    def _try_add_tool_call(raw_json: str) -> None:
-        try:
-            obj = json.loads(raw_json)
-        except Exception:
-            return
-        if not isinstance(obj, dict):
-            return
-        fn = obj.get("function")
-        if not isinstance(fn, dict):
-            return
-        fn_name = fn.get("name")
-        if not isinstance(fn_name, str) or not fn_name.strip():
-            return
-        fn_args = fn.get("arguments", "{}")
-        if not isinstance(fn_args, str):
-            fn_args = json.dumps(fn_args, ensure_ascii=False)
-        call_id = obj.get("id")
-        if not isinstance(call_id, str) or not call_id.strip():
+    def _add_parsed(parsed: dict[str, Any]) -> None:
+        call_id = parsed.get("id") or ""
+        if not call_id:
             call_id = f"acp_call_{len(extracted)+1}"
-
         extracted.append(
             _build_openai_tool_call(
                 call_id=call_id,
-                name=fn_name.strip(),
-                arguments=fn_args,
+                name=parsed["name"],
+                arguments=parsed["arguments"],
             )
         )
+
+    def _try_add_tool_call(raw_json: str) -> None:
+        parsed = _try_parse_openai_tool_json(raw_json)
+        if parsed is not None:
+            _add_parsed(parsed)
 
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         raw = m.group(1)
@@ -395,6 +569,14 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
             raw = m.group(0)
             _try_add_tool_call(raw)
             consumed_spans.append((m.start(), m.end()))
+
+    for start, end, parsed in _extract_invoke_xml_calls(text):
+        _add_parsed(parsed)
+        consumed_spans.append((start, end))
+
+    if extracted:
+        for match in _FUNCTION_CALLS_RE.finditer(text):
+            consumed_spans.append((match.start(), match.end()))
 
     if not consumed_spans:
         return extracted, text.strip()
@@ -530,6 +712,17 @@ class CopilotACPClient:
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        hermes_names = _hermes_tool_names(tools)
+        matched = _select_hermes_tool_calls(tool_calls, hermes_names)
+        if matched:
+            tool_calls = matched
+        else:
+            fail_once = _bridge_fail_once_error(
+                response_text, tool_calls, hermes_names
+            )
+            if fail_once:
+                tool_calls = []
+                cleaned_text = fail_once
 
         usage = SimpleNamespace(
             prompt_tokens=0,

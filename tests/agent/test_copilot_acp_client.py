@@ -317,3 +317,92 @@ def test_probe_skipped_for_custom_args_without_acp():
     with _patch("agent.copilot_acp_client.subprocess.run") as run_mock:
         assert _acp_supported("mycli", ["--custom-transport"]) is True
     run_mock.assert_not_called()
+
+
+from agent.copilot_acp_client import (
+    BRIDGE_WRONG_TOOL_FORMAT,
+    _captures_to_tool_calls,
+    _extract_tool_calls_from_text,
+)
+
+
+def test_extract_invoke_parameter_xml_to_openai_tool_calls():
+    text = (
+        "I'll run it.\n"
+        "<function_calls>\n"
+        '<invoke name="terminal">\n'
+        "<parameter name=\"command\">uname</parameter>\n"
+        "</invoke>\n"
+        "</function_calls>"
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].function.name == "terminal"
+    assert json.loads(calls[0].function.arguments) == {"command": "uname"}
+    assert "I'll run it." in cleaned
+    assert "<invoke" not in cleaned
+
+
+def test_extract_json_tool_call_block_still_works():
+    text = (
+        "<tool_call>"
+        '{"id":"call_1","type":"function",'
+        '"function":{"name":"terminal","arguments":"{\\"command\\":\\"uname\\"}"}}'
+        "</tool_call>"
+    )
+    calls, cleaned = _extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].id == "call_1"
+    assert calls[0].function.name == "terminal"
+    assert json.loads(calls[0].function.arguments) == {"command": "uname"}
+    assert cleaned == ""
+
+
+def test_captures_to_tool_calls_records_name_args_id():
+    calls = _captures_to_tool_calls(
+        [("terminal", {"command": "uname"}, "call_x")]
+    )
+    assert calls[0].function.name == "terminal"
+    assert calls[0].id == "call_x"
+    assert json.loads(calls[0].function.arguments) == {"command": "uname"}
+
+
+def test_copilot_acp_maps_invoke_xml_to_hermes_tool_calls():
+    client = CopilotACPClient(acp_cwd="/tmp")
+    xml = (
+        '<invoke name="read_file">'
+        "<parameter name=\"path\">README.md</parameter>"
+        "</invoke>"
+    )
+    with patch.object(client, "_run_prompt", return_value=(xml, "")) as run:
+        completion = client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "read README.md"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "read_file"},
+                }
+            ],
+        )
+    assert run.call_count == 1
+    assert completion.choices[0].finish_reason == "tool_calls"
+    call = completion.choices[0].message.tool_calls[0]
+    assert call.function.name == "read_file"
+    assert json.loads(call.function.arguments) == {"path": "README.md"}
+
+
+def test_copilot_untranslatable_tool_not_found_fails_once():
+    client = CopilotACPClient(acp_cwd="/tmp")
+    not_found = "Tool not found: terminal\nAvailable tools:"
+    with patch.object(client, "_run_prompt", return_value=(not_found, "")) as run:
+        completion = client._create_chat_completion(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "uname"}],
+            tools=[{"type": "function", "function": {"name": "terminal"}}],
+        )
+    assert run.call_count == 1
+    assert completion.choices[0].finish_reason == "stop"
+    assert completion.choices[0].message.tool_calls in (None, [], ())
+    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+    assert "Available tools:" not in completion.choices[0].message.content
