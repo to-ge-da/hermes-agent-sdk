@@ -50,8 +50,9 @@ _FUNCTION_CALLS_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _FENCED_CODE_RE = re.compile(r"```[^\n]*\r?\n.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 _UNTRANSLATED_MARKUP_RE = re.compile(
-    r"<invoke\b|<parameter\b|<function_calls\b",
+    r"<invoke\b[^>]*\bname\s*=|<parameter\b[^>]*\bname\s*=|<function_calls\b",
     re.IGNORECASE,
 )
 # Cursor/ACP empty-allowlist reject. Line-anchored so prose that merely
@@ -414,6 +415,10 @@ def _fenced_code_spans(text: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in _FENCED_CODE_RE.finditer(text)]
 
 
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _INLINE_CODE_RE.finditer(text)]
+
+
 def _tool_call_block_spans(text: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
 
@@ -619,7 +624,10 @@ def _looks_like_untranslated_bridge_markup(text: str) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     inspect = _strip_spans(
-        text, _fenced_code_spans(text) + _tool_call_block_spans(text)
+        text,
+        _fenced_code_spans(text)
+        + _inline_code_spans(text)
+        + _tool_call_block_spans(text),
     )
     if _UNTRANSLATED_MARKUP_RE.search(inspect):
         return True
@@ -645,6 +653,58 @@ def _bridge_fail_once_error(
     if not _looks_like_untranslated_bridge_markup(text or ""):
         return None
     return BRIDGE_WRONG_TOOL_FORMAT
+
+
+_BRIDGE_CONTROL_STRINGS = (BRIDGE_WRONG_TOOL_FORMAT, _CUSTOM_TOOL_DEFERRAL)
+
+
+def looks_like_harness_tool_reject(text: str) -> bool:
+    """True when the reply is the harness' own 'Tool not found:' rejection."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    inspect = _strip_spans(
+        text,
+        _fenced_code_spans(text)
+        + _inline_code_spans(text)
+        + _tool_call_block_spans(text),
+    )
+    return bool(_TOOL_NOT_FOUND_RE.search(inspect))
+
+
+def strip_bridge_sentinels(text: str) -> str:
+    """Remove bridge control strings; blank lines collapse. Never returns None."""
+    if not isinstance(text, str):
+        return ""
+    out = text
+    for sentinel in _BRIDGE_CONTROL_STRINGS:
+        out = out.replace(sentinel, "")
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def bridge_salvage_text(text: str) -> str:
+    """Prose the model wrote BEFORE an untranslatable call attempt.
+
+    '' when the reply is the harness' own reject or is nothing but markup —
+    those turns must be retried, not half-answered.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    if looks_like_harness_tool_reject(text):
+        return ""
+    match = _UNTRANSLATED_MARKUP_RE.search(text)
+    cut = text if match is None else text[: match.start()]
+    return strip_bridge_sentinels(cut)
+
+
+def _bridge_excerpt(text: str, limit: int = 160) -> str:
+    """Whitespace-collapsed truncation for error messages."""
+    raw = str(text or "")
+    if looks_like_harness_tool_reject(raw):
+        # Do not leak the harness' "Available tools:" catalog to the user.
+        raw = raw.split("Available tools:", 1)[0]
+    flat = " ".join(raw.split())
+    return flat[:limit]
 
 
 def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
@@ -683,7 +743,9 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
             _try_add_tool_call(raw)
             consumed_spans.append((m.start(), m.end()))
 
-    skip_spans = list(consumed_spans) + _fenced_code_spans(text)
+    skip_spans = (
+        list(consumed_spans) + _fenced_code_spans(text) + _inline_code_spans(text)
+    )
     for start, end, parsed in _extract_invoke_xml_calls(text, skip_spans=skip_spans):
         if parsed is not None:
             _add_parsed(parsed)
@@ -820,14 +882,19 @@ class CopilotACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         hermes_names = _hermes_tool_names(tools)
-        fail_once = _bridge_fail_once_error(
-            response_text, tool_calls, hermes_names
-        )
+        fail_once = _bridge_fail_once_error(response_text, tool_calls, hermes_names)
         if fail_once:
-            tool_calls = []
-            cleaned_text = fail_once
+            salvage = bridge_salvage_text(response_text)
+            if not salvage:
+                raise RuntimeError(
+                    "Copilot ACP returned a tool call Hermes could not translate "
+                    "and no usable text. Retrying on a fresh ACP session. "
+                    f"Model said: {_bridge_excerpt(response_text)}"
+                )
+            tool_calls, cleaned_text = [], salvage
         else:
             tool_calls = _select_hermes_tool_calls(tool_calls, hermes_names)
+            cleaned_text = strip_bridge_sentinels(cleaned_text)
 
         usage = SimpleNamespace(
             prompt_tokens=0,

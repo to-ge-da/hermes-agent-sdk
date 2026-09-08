@@ -324,11 +324,13 @@ def test_probe_skipped_for_custom_args_without_acp():
 
 from agent.copilot_acp_client import (
     BRIDGE_WRONG_TOOL_FORMAT,
+    _CUSTOM_TOOL_DEFERRAL,
     _bridge_fail_once_error,
     _captures_to_tool_calls,
     _extract_tool_calls_from_text,
     _looks_like_untranslated_bridge_markup,
     _select_hermes_tool_calls,
+    bridge_salvage_text,
 )
 
 
@@ -402,16 +404,17 @@ def test_copilot_untranslatable_tool_not_found_fails_once():
     client = CopilotACPClient(acp_cwd="/tmp")
     not_found = "Tool not found: terminal\nAvailable tools:"
     with patch.object(client, "_run_prompt", return_value=(not_found, "")) as run:
-        completion = client._create_chat_completion(
-            model="copilot-acp",
-            messages=[{"role": "user", "content": "uname"}],
-            tools=[{"type": "function", "function": {"name": "terminal"}}],
-        )
+        with pytest.raises(RuntimeError) as exc_info:
+            client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "uname"}],
+                tools=[{"type": "function", "function": {"name": "terminal"}}],
+            )
     assert run.call_count == 1
-    assert completion.choices[0].finish_reason == "stop"
-    assert completion.choices[0].message.tool_calls in (None, [], ())
-    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
-    assert "Available tools:" not in completion.choices[0].message.content
+    message = str(exc_info.value)
+    assert message != BRIDGE_WRONG_TOOL_FORMAT
+    assert BRIDGE_WRONG_TOOL_FORMAT not in message
+    assert "Available tools:" not in message
 
 
 def test_invoke_inside_tool_call_json_arg_is_not_extracted():
@@ -521,14 +524,16 @@ def test_mixed_valid_and_unknown_names_fail_the_turn():
     )
     client = CopilotACPClient(acp_cwd="/tmp")
     with patch.object(client, "_run_prompt", return_value=(text, "")):
-        completion = client._create_chat_completion(
-            model="copilot-acp",
-            messages=[{"role": "user", "content": "uname"}],
-            tools=[{"type": "function", "function": {"name": "terminal"}}],
-        )
-    assert completion.choices[0].finish_reason == "stop"
-    assert completion.choices[0].message.tool_calls in (None, [], ())
-    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+        with pytest.raises(RuntimeError) as exc_info:
+            client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "uname"}],
+                tools=[{"type": "function", "function": {"name": "terminal"}}],
+            )
+    message = str(exc_info.value)
+    assert message != BRIDGE_WRONG_TOOL_FORMAT
+    assert BRIDGE_WRONG_TOOL_FORMAT not in message
+    assert "Available tools:" not in message
 
 
 def test_no_hermes_tools_offered_does_not_pass_unknown_names_through():
@@ -543,10 +548,67 @@ def test_no_hermes_tools_offered_does_not_pass_unknown_names_through():
 
     client = CopilotACPClient(acp_cwd="/tmp")
     with patch.object(client, "_run_prompt", return_value=(text, "")):
-        completion = client._create_chat_completion(
-            model="copilot-acp",
-            messages=[{"role": "user", "content": "uname"}],
-            tools=None,
-        )
-    assert completion.choices[0].message.tool_calls in (None, [], ())
-    assert completion.choices[0].message.content == BRIDGE_WRONG_TOOL_FORMAT
+        with pytest.raises(RuntimeError) as exc_info:
+            client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "uname"}],
+                tools=None,
+            )
+    message = str(exc_info.value)
+    assert message != BRIDGE_WRONG_TOOL_FORMAT
+    assert BRIDGE_WRONG_TOOL_FORMAT not in message
+    assert "Available tools:" not in message
+
+
+def test_acp_bridge_sentinel_is_never_the_assistant_reply():
+    cases = [
+        "Tool not found: terminal\nAvailable tools:",
+        (
+            '<invoke name="terminal">'
+            "<parameter name=\"command\">uname</parameter>"
+            "</invoke>"
+        ),
+        _CUSTOM_TOOL_DEFERRAL,
+    ]
+    client = CopilotACPClient(acp_cwd="/tmp")
+    for response_text in cases:
+        with patch.object(client, "_run_prompt", return_value=(response_text, "")):
+            try:
+                completion = client._create_chat_completion(
+                    model="copilot-acp",
+                    messages=[{"role": "user", "content": "uname"}],
+                    tools=[{"type": "function", "function": {"name": "terminal"}}],
+                )
+            except RuntimeError as exc:
+                assert str(exc) != BRIDGE_WRONG_TOOL_FORMAT
+                assert BRIDGE_WRONG_TOOL_FORMAT not in str(exc)
+                continue
+            content = completion.choices[0].message.content or ""
+            assert content != BRIDGE_WRONG_TOOL_FORMAT
+            assert _CUSTOM_TOOL_DEFERRAL not in content
+
+
+def test_inline_code_invoke_is_neither_extracted_nor_flagged():
+    text = 'The extractor parses `<invoke name="terminal">` tags.'
+    assert _looks_like_untranslated_bridge_markup(text) is False
+    calls, _cleaned = _extract_tool_calls_from_text(text)
+    assert calls == []
+
+
+def test_bridge_salvage_text_contract():
+    xml = (
+        '<invoke name="terminal">'
+        "<parameter name=\"command\">uname</parameter>"
+        "</invoke>"
+    )
+    assert bridge_salvage_text("Tool not found: terminal\nAvailable tools:") == ""
+    assert bridge_salvage_text(xml) == ""
+    assert bridge_salvage_text("I'll check.\n" + xml) == "I'll check."
+    with_sentinel = f"hello {BRIDGE_WRONG_TOOL_FORMAT} there"
+    salvaged = bridge_salvage_text(with_sentinel)
+    assert BRIDGE_WRONG_TOOL_FORMAT not in salvaged
+    assert "hello" in salvaged
+    assert "there" in salvaged
+    deferral = bridge_salvage_text("hello " + _CUSTOM_TOOL_DEFERRAL)
+    assert _CUSTOM_TOOL_DEFERRAL not in deferral
+    assert "hello" in deferral

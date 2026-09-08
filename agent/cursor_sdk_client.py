@@ -42,6 +42,7 @@ from typing import Any
 
 from agent.copilot_acp_client import (
     _CUSTOM_TOOL_DEFERRAL,
+    _bridge_excerpt,
     _bridge_fail_once_error,
     _captures_to_tool_calls,
     _extract_tool_calls_from_text,
@@ -49,6 +50,8 @@ from agent.copilot_acp_client import (
     _looks_like_untranslated_bridge_markup,
     _select_hermes_tool_calls,
     _unknown_bridge_tool_names,
+    bridge_salvage_text,
+    strip_bridge_sentinels,
 )
 from hermes_constants import display_hermes_home
 
@@ -859,7 +862,9 @@ def format_hermes_cursor_prompt(
         "<tool_call>{\"id\":\"call_1\",\"type\":\"function\","
         "\"function\":{\"name\":\"NAME\",\"arguments\":\"{...}\"}}</tool_call> "
         "blocks. arguments must be a JSON string. Do not use Cursor, ACP, or "
-        "workspace tools — only the Hermes tools listed below.",
+        "workspace tools — only the Hermes tools listed below. The same Hermes "
+        "tools are also registered as callable tools on this agent; calling one "
+        "directly works — Hermes executes it either way.",
         "If no tool is needed, answer in plain text.",
     ]
     if model:
@@ -893,7 +898,7 @@ def format_hermes_cursor_prompt(
             "assistant": "Assistant",
             "tool": "Tool",
         }.get(role, "Context")
-        text = _message_text(message).strip()
+        text = strip_bridge_sentinels(_message_text(message)).strip()
         if text:
             transcript.append(f"{label}:\n{text}")
     if transcript:
@@ -916,10 +921,12 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
             break
     parts: list[str] = []
     if last_user is not None:
-        parts.append("User:\n" + _message_text(last_user).strip())
+        user_text = strip_bridge_sentinels(_message_text(last_user)).strip()
+        if user_text:
+            parts.append("User:\n" + user_text)
         for message in typed[last_user_i + 1 :]:
             role = str(message.get("role") or "").lower()
-            text = _message_text(message).strip()
+            text = strip_bridge_sentinels(_message_text(message)).strip()
             if not text:
                 continue
             if role == "tool":
@@ -927,7 +934,9 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
             elif role == "assistant":
                 parts.append("Assistant:\n" + text)
     else:
-        parts.append(_message_text(typed[-1]).strip())
+        tail = strip_bridge_sentinels(_message_text(typed[-1])).strip()
+        if tail:
+            parts.append(tail)
     return "\n\n".join(p for p in parts if p)
 
 
@@ -1132,7 +1141,7 @@ class CursorSDKClient:
                 return live
         return self._session_id
 
-    def _slot_key(self, model: str) -> str:
+    def _slot_key(self, model: str, tool_names: frozenset[str] | None = None) -> str:
         cwd = (
             os.environ.get("HERMES_CURSOR_SDK_CWD")
             or os.environ.get("CURSOR_SDK_CWD")
@@ -1159,7 +1168,14 @@ class CursorSDKClient:
             or "default"
         )
         selection = json.dumps(cursor_sdk_model(model), sort_keys=True)
-        return f"{session}::{selection}::{cwd}"
+        key = f"{session}::{selection}::{cwd}"
+        names = tool_names or frozenset()
+        if names:
+            digest = hashlib.blake2b(
+                "|".join(sorted(names)).encode("utf-8"), digest_size=8
+            ).hexdigest()
+            key = f"{key}::t{digest}"
+        return key
 
     def _prepare_slot(
         self, rec: dict[str, Any], anchor: tuple[int, str]
@@ -1226,7 +1242,8 @@ class CursorSDKClient:
     ) -> Any:
         del timeout, tool_choice
         model_id = model or "grok-4.6"
-        slot = self._slot_key(model_id)
+        tool_names = frozenset(_hermes_tool_names(tools))
+        slot = self._slot_key(model_id, tool_names)
         rec = _slot_record(slot)
         resume = self._prepare_slot(rec, transcript_anchor(messages))
         prompt_text = format_hermes_cursor_prompt(
@@ -1274,7 +1291,7 @@ class CursorSDKClient:
                 tools=tools,
             )
         tool_calls, cleaned_text = self._tool_calls_after_turn(
-            response_text, tools=tools, model_id=model_id
+            response_text, tools=tools, model_id=model_id, tool_names=tool_names
         )
         usage = _openai_usage_from_cursor(self._last_usage)
         assistant_message = SimpleNamespace(
@@ -1298,9 +1315,11 @@ class CursorSDKClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _abandon_slot(self, model: str) -> None:
+    def _abandon_slot(
+        self, model: str, tool_names: frozenset[str] | None = None
+    ) -> None:
         """Drop the live Agent so the next turn does not resume poisoned markup."""
-        slot = self._slot_key(model)
+        slot = self._slot_key(model, tool_names)
         with _slots_guard:
             rec = _slots.get(slot)
         if rec is None:
@@ -1314,26 +1333,46 @@ class CursorSDKClient:
         *,
         tools: list[dict[str, Any]] | None,
         model_id: str,
+        tool_names: frozenset[str] | None,
     ) -> tuple[list[Any], str]:
         hermes_names = _hermes_tool_names(tools)
         captured = _captures_to_tool_calls(self._last_captures)
         if captured:
-            fail = _bridge_fail_once_error(response_text, captured, hermes_names)
-            if fail and _unknown_bridge_tool_names(captured, hermes_names):
-                self._abandon_slot(model_id)
-                return [], fail
             matched = _select_hermes_tool_calls(captured, hermes_names)
             if matched:
+                unknown = _unknown_bridge_tool_names(captured, hermes_names)
+                if unknown:
+                    log.warning(
+                        "Cursor: ignoring non-Hermes captured tool name(s) %s "
+                        "alongside %d dispatchable Hermes call(s)",
+                        ", ".join(sorted(set(unknown))[:4]),
+                        len(matched),
+                    )
                 return matched, ""
+            if _unknown_bridge_tool_names(captured, hermes_names):
+                return self._fail_bridge_turn(response_text, model_id, tool_names)
         extracted, cleaned = _extract_tool_calls_from_text(response_text)
-        fail = _bridge_fail_once_error(response_text, extracted, hermes_names)
-        if fail:
-            self._abandon_slot(model_id)
-            return [], fail
+        if _bridge_fail_once_error(response_text, extracted, hermes_names):
+            return self._fail_bridge_turn(response_text, model_id, tool_names)
         matched = _select_hermes_tool_calls(extracted, hermes_names)
-        if matched:
-            return matched, cleaned
-        return [], cleaned
+        return matched, strip_bridge_sentinels(cleaned)
+
+    def _fail_bridge_turn(
+        self,
+        response_text: str,
+        model_id: str,
+        tool_names: frozenset[str] | None,
+    ) -> tuple[list[Any], str]:
+        salvage = bridge_salvage_text(response_text)
+        if salvage:
+            return [], salvage
+        self._abandon_slot(model_id, tool_names)
+        raise CursorSDKError(
+            "Cursor returned a tool call Hermes could not translate and no "
+            "usable text. The Cursor agent was dropped; retrying cold. "
+            f"Model said: {_bridge_excerpt(response_text)}",
+            status_code=502,
+        )
 
     def _run_prompt(self, prompt_text: str, *, model: str) -> str:
         """Test hook / oneshot path: one Agent.prompt, no session cache."""
@@ -1387,6 +1426,8 @@ class CursorSDKClient:
         self._last_captures = []
 
         def _options_for(bucket: list[Any]) -> dict[str, Any]:
+            # SendOptions carries no tools/custom_tools, so the create-time
+            # surface is the whole life of the Agent.
             # Documented cursor-sdk semantics (cursor.com/docs/sdk/python):
             # `tools=[]` offers no built-in tools and the model can only
             # respond with text. Deny wins: when `tools` is set, a tool must
@@ -1415,7 +1456,7 @@ class CursorSDKClient:
             if sources:
                 _raise_for_failed_run(*sources)
             if self._last_captures:
-                return text if text.strip() else _CUSTOM_TOOL_DEFERRAL
+                return text
             detail = _run_failure_detail(*sources) if sources else ""
             combined = "\n".join(
                 part for part in (text, detail) if part and str(part).strip()
@@ -1439,7 +1480,7 @@ class CursorSDKClient:
                 text = "" if text is None else str(text)
             return _finish_turn(text, result, bucket=capture_bucket)
 
-        slot = slot or self._slot_key(model)
+        slot = slot or self._slot_key(model, frozenset(_hermes_tool_names(tools)))
         rec = _slot_record(slot)
         _evict_idle_slots(slot)
         run = None
