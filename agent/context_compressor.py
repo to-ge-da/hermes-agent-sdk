@@ -4748,26 +4748,29 @@ This compaction should PRIORITISE preserving all information related to the focu
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
-            #      a permanent misconfiguration, long cooldown is correct.
+            #      a permanent misconfiguration; no cooldown, go straight to
+            #      the deterministic fallback.
             #   2. An empty/invalid response from a configured provider
             #      (``_validate_llm_response`` empty-``choices``/``None``, or our
             #      empty-``content`` guard above) — a transient/proxy fault that
             #      should fall back to the main model first, exactly like the
             #      transport errors handled below.
-            # Only (1) belongs in the long no-provider cooldown; (2) and every
-            # other exception flow into the generic fallback logic so they get
-            # a main-model retry before any cooldown. (#11978, #11914)
+            # Only (1) skips the cooldown machinery; (2) and every other
+            # exception flow into the generic fallback logic so they get a
+            # main-model retry before any cooldown. (#11978, #11914)
             if isinstance(e, RuntimeError) and "no llm provider configured" in str(e).lower():
-                # No provider configured — long cooldown, unlikely to self-resolve
-                self._record_compression_failure_cooldown(
-                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
-                    "no auxiliary LLM provider configured",
-                )
+                # No provider configured — NOT a transient failure. Arming the
+                # summary-failure cooldown here blocked
+                # _automatic_compression_blocked_locally() for 600s, so the
+                # deterministic (non-LLM) fallback — the only shrink available
+                # without a summarizer — never ran and the session stalled above
+                # the threshold until a cooldown no provider would ever clear
+                # expired (#8). Record the condition for surfacing and fall
+                # through to the deterministic fallback instead.
                 self._last_summary_error = "no auxiliary LLM provider configured"
                 logger.warning("Context compression: no provider available for "
-                                "summary. Middle turns will be dropped without summary "
-                                "for %d seconds.",
-                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+                                "summary. Middle turns will be dropped with a "
+                                "deterministic fallback summary instead.")
                 return None
             # If the summary model is different from the main model and the
             # error looks permanent (model not found, 503, 404), fall back to
