@@ -6,8 +6,15 @@ real JSON schema, the model emits <tool_call> JSON, and Hermes executes it —
 same shape as Copilot ACP, without ACP wording (that makes Cursor walk the
 repo with its own tools).
 
-Cursor-native tools stay off (tools=[], mcp_servers={}). That is not a Hermes
-allowlist; it is "do not give Cursor a second filesystem."
+Cursor-native tools stay off (tools=["mcp"], mcp_servers={}). That is not a
+Hermes allowlist; it is "do not give Cursor a second filesystem."
+`tools=[]` is documented as "no built-in tools; the model can only respond
+with text", and deny-wins requires a tool to be in `tools` when that field
+is set. Custom tools ride the built-in `custom-user-tools` MCP server, so
+omitting the `mcp` group hides Hermes `local.custom_tools` and Part 1
+captures never fire. `tools=["mcp"]` + empty `mcp_servers` exposes ONLY
+those Hermes names. Assumption per cursor.com/docs/sdk/python — a live
+Cursor-hosted session test is still required before merge.
 
 A live Agent is reused across turns in this process. Cold start sends a
 windowed transcript; later turns send only the latest user line plus any
@@ -33,7 +40,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.copilot_acp_client import _extract_tool_calls_from_text
+from agent.copilot_acp_client import (
+    _CUSTOM_TOOL_DEFERRAL,
+    _bridge_excerpt,
+    _bridge_fail_once_error,
+    _captures_to_tool_calls,
+    _extract_tool_calls_from_text,
+    _hermes_tool_names,
+    _looks_like_untranslated_bridge_markup,
+    _select_hermes_tool_calls,
+    _unknown_bridge_tool_names,
+    bridge_salvage_text,
+    strip_bridge_sentinels,
+)
 from hermes_constants import display_hermes_home
 
 log = logging.getLogger(__name__)
@@ -685,6 +704,150 @@ def hermes_tools_spec(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]
     return specs
 
 
+def _hermes_custom_tools(
+    tools: list[dict[str, Any]] | None,
+    bucket: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """Allowlist Hermes names as Cursor local.custom_tools; do not execute."""
+    custom: dict[str, dict[str, Any]] = {}
+    for spec in hermes_tools_spec(tools):
+        name = spec["name"]
+
+        def _execute(args: Any, context: Any = None, *, _name: str = name) -> str:
+            call_id = None
+            if context is not None:
+                call_id = getattr(context, "tool_call_id", None)
+            bucket.append((_name, args, call_id))
+            return _CUSTOM_TOOL_DEFERRAL
+
+        custom[name] = {
+            "description": spec.get("description") or "",
+            "input_schema": spec.get("parameters")
+            or {"type": "object", "properties": {}},
+            "execute": _execute,
+        }
+    return custom
+
+
+_MAX_SDK_TOOL_WALK = 32
+
+
+def _iter_sdk_tool_calls(
+    source: Any,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> list[tuple[str, Any, str | None]]:
+    """Walk a materialized conversation snapshot for tool_call events.
+
+    Does not drain ``run.messages()`` (a live generator). Only sequences
+    already in memory are walked, with a depth/identity bound so cycles
+    cannot rely on the caller's ``except`` to terminate.
+    """
+    out: list[tuple[str, Any, str | None]] = []
+    if source is None or isinstance(source, (str, bytes, bytearray)):
+        return out
+    if _depth > _MAX_SDK_TOOL_WALK:
+        return out
+    seen = _seen if _seen is not None else set()
+    ident = id(source)
+    if ident in seen:
+        return out
+    seen.add(ident)
+    if isinstance(source, dict):
+        items: list[Any] = [source]
+    elif isinstance(source, (list, tuple)):
+        items = list(source)
+    else:
+        messages = getattr(source, "messages", None)
+        if callable(messages):
+            messages = None
+        if isinstance(messages, (list, tuple)) and messages is not source:
+            return _iter_sdk_tool_calls(
+                messages, _depth=_depth + 1, _seen=seen
+            )
+        items = [source]
+    for msg in items:
+        if msg is None or msg is source:
+            continue
+        if isinstance(msg, dict):
+            mtype = msg.get("type")
+            name = msg.get("name")
+            args = msg.get("args", msg.get("arguments"))
+            call_id = msg.get("call_id") or msg.get("tool_call_id") or msg.get("id")
+            nested = msg.get("message")
+        else:
+            mtype = getattr(msg, "type", None)
+            name = getattr(msg, "name", None)
+            args = getattr(msg, "args", None)
+            if args is None:
+                args = getattr(msg, "arguments", None)
+            call_id = getattr(msg, "call_id", None) or getattr(
+                msg, "tool_call_id", None
+            )
+            nested = getattr(msg, "message", None)
+        if str(mtype or "").lower() in {"tool_call", "tooluse", "tool_use"}:
+            if isinstance(name, str) and name.strip():
+                out.append(
+                    (
+                        name.strip(),
+                        args,
+                        call_id if isinstance(call_id, str) else None,
+                    )
+                )
+            continue
+        if nested is not None and nested is not msg:
+            out.extend(
+                _iter_sdk_tool_calls(nested, _depth=_depth + 1, _seen=seen)
+            )
+    return out
+
+
+def _tool_event_dedup_key(item: tuple[str, Any, str | None]) -> tuple[Any, ...]:
+    return (item[0], json.dumps(item[1], sort_keys=True, default=str), item[2])
+
+
+def _dedup_tool_events(
+    items: list[tuple[str, Any, str | None]],
+) -> list[tuple[str, Any, str | None]]:
+    seen: set[tuple[Any, ...]] = set()
+    out: list[tuple[str, Any, str | None]] = []
+    for item in items:
+        key = _tool_event_dedup_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _collect_run_tool_events(*sources: Any) -> list[tuple[str, Any, str | None]]:
+    """Best-effort tool_call events after wait().
+
+    Walks ``conversation()`` snapshots and ``tool_calls`` / ``tool_events``.
+    Does not call ``run.messages()`` — that generator is a live drain.
+    """
+    out: list[tuple[str, Any, str | None]] = []
+
+    def _add(items: list[tuple[str, Any, str | None]]) -> None:
+        out.extend(items)
+
+    for source in sources:
+        if source is None:
+            continue
+        conv = getattr(source, "conversation", None)
+        if callable(conv):
+            try:
+                _add(_iter_sdk_tool_calls(conv()))
+            except Exception:
+                pass
+        for attr in ("tool_calls", "tool_events"):
+            val = getattr(source, attr, None)
+            if val:
+                _add(_iter_sdk_tool_calls(val))
+    return _dedup_tool_events(out)
+
+
 def format_hermes_cursor_prompt(
     messages: list[dict[str, Any]],
     *,
@@ -699,7 +862,9 @@ def format_hermes_cursor_prompt(
         "<tool_call>{\"id\":\"call_1\",\"type\":\"function\","
         "\"function\":{\"name\":\"NAME\",\"arguments\":\"{...}\"}}</tool_call> "
         "blocks. arguments must be a JSON string. Do not use Cursor, ACP, or "
-        "workspace tools — only the Hermes tools listed below.",
+        "workspace tools — only the Hermes tools listed below. The same Hermes "
+        "tools are also registered as callable tools on this agent; calling one "
+        "directly works — Hermes executes it either way.",
         "If no tool is needed, answer in plain text.",
     ]
     if model:
@@ -733,7 +898,7 @@ def format_hermes_cursor_prompt(
             "assistant": "Assistant",
             "tool": "Tool",
         }.get(role, "Context")
-        text = _message_text(message).strip()
+        text = strip_bridge_sentinels(_message_text(message)).strip()
         if text:
             transcript.append(f"{label}:\n{text}")
     if transcript:
@@ -756,10 +921,12 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
             break
     parts: list[str] = []
     if last_user is not None:
-        parts.append("User:\n" + _message_text(last_user).strip())
+        user_text = strip_bridge_sentinels(_message_text(last_user)).strip()
+        if user_text:
+            parts.append("User:\n" + user_text)
         for message in typed[last_user_i + 1 :]:
             role = str(message.get("role") or "").lower()
-            text = _message_text(message).strip()
+            text = strip_bridge_sentinels(_message_text(message)).strip()
             if not text:
                 continue
             if role == "tool":
@@ -767,7 +934,9 @@ def _resume_delta(messages: list[dict[str, Any]]) -> str:
             elif role == "assistant":
                 parts.append("Assistant:\n" + text)
     else:
-        parts.append(_message_text(typed[-1]).strip())
+        tail = strip_bridge_sentinels(_message_text(typed[-1])).strip()
+        if tail:
+            parts.append(tail)
     return "\n\n".join(p for p in parts if p)
 
 
@@ -952,6 +1121,7 @@ class CursorSDKClient:
         self.chat = _CursorChatNamespace(self)
         self.is_closed = False
         self._last_usage: Any = None
+        self._last_captures: list[Any] = []
 
     def close(self) -> None:
         self.is_closed = True
@@ -971,7 +1141,7 @@ class CursorSDKClient:
                 return live
         return self._session_id
 
-    def _slot_key(self, model: str) -> str:
+    def _slot_key(self, model: str, tool_names: frozenset[str] | None = None) -> str:
         cwd = (
             os.environ.get("HERMES_CURSOR_SDK_CWD")
             or os.environ.get("CURSOR_SDK_CWD")
@@ -998,7 +1168,14 @@ class CursorSDKClient:
             or "default"
         )
         selection = json.dumps(cursor_sdk_model(model), sort_keys=True)
-        return f"{session}::{selection}::{cwd}"
+        key = f"{session}::{selection}::{cwd}"
+        names = tool_names or frozenset()
+        if names:
+            digest = hashlib.blake2b(
+                "|".join(sorted(names)).encode("utf-8"), digest_size=8
+            ).hexdigest()
+            key = f"{key}::t{digest}"
+        return key
 
     def _prepare_slot(
         self, rec: dict[str, Any], anchor: tuple[int, str]
@@ -1065,7 +1242,8 @@ class CursorSDKClient:
     ) -> Any:
         del timeout, tool_choice
         model_id = model or "grok-4.6"
-        slot = self._slot_key(model_id)
+        tool_names = frozenset(_hermes_tool_names(tools))
+        slot = self._slot_key(model_id, tool_names)
         rec = _slot_record(slot)
         resume = self._prepare_slot(rec, transcript_anchor(messages))
         prompt_text = format_hermes_cursor_prompt(
@@ -1085,7 +1263,12 @@ class CursorSDKClient:
             )
         try:
             response_text = self._run_turn(
-                prompt_text, model=model_id, resume=resume, images=images, slot=slot
+                prompt_text,
+                model=model_id,
+                resume=resume,
+                images=images,
+                slot=slot,
+                tools=tools,
             )
         except _ColdStartRequired:
             # The live agent could not take the delta, so the replacement
@@ -1100,9 +1283,16 @@ class CursorSDKClient:
             )
             images = self._turn_images(rec, messages or [], resume=False)
             response_text = self._run_turn(
-                prompt_text, model=model_id, resume=False, images=images, slot=slot
+                prompt_text,
+                model=model_id,
+                resume=False,
+                images=images,
+                slot=slot,
+                tools=tools,
             )
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        tool_calls, cleaned_text = self._tool_calls_after_turn(
+            response_text, tools=tools, model_id=model_id, tool_names=tool_names
+        )
         usage = _openai_usage_from_cursor(self._last_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
@@ -1125,6 +1315,65 @@ class CursorSDKClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
+    def _abandon_slot(
+        self, model: str, tool_names: frozenset[str] | None = None
+    ) -> None:
+        """Drop the live Agent so the next turn does not resume poisoned markup."""
+        slot = self._slot_key(model, tool_names)
+        with _slots_guard:
+            rec = _slots.get(slot)
+        if rec is None:
+            return
+        with rec["lock"]:
+            _drop_agent(rec)
+
+    def _tool_calls_after_turn(
+        self,
+        response_text: str,
+        *,
+        tools: list[dict[str, Any]] | None,
+        model_id: str,
+        tool_names: frozenset[str] | None,
+    ) -> tuple[list[Any], str]:
+        hermes_names = _hermes_tool_names(tools)
+        captured = _captures_to_tool_calls(self._last_captures)
+        if captured:
+            matched = _select_hermes_tool_calls(captured, hermes_names)
+            if matched:
+                unknown = _unknown_bridge_tool_names(captured, hermes_names)
+                if unknown:
+                    log.warning(
+                        "Cursor: ignoring non-Hermes captured tool name(s) %s "
+                        "alongside %d dispatchable Hermes call(s)",
+                        ", ".join(sorted(set(unknown))[:4]),
+                        len(matched),
+                    )
+                return matched, ""
+            if _unknown_bridge_tool_names(captured, hermes_names):
+                return self._fail_bridge_turn(response_text, model_id, tool_names)
+        extracted, cleaned = _extract_tool_calls_from_text(response_text)
+        if _bridge_fail_once_error(response_text, extracted, hermes_names):
+            return self._fail_bridge_turn(response_text, model_id, tool_names)
+        matched = _select_hermes_tool_calls(extracted, hermes_names)
+        return matched, strip_bridge_sentinels(cleaned)
+
+    def _fail_bridge_turn(
+        self,
+        response_text: str,
+        model_id: str,
+        tool_names: frozenset[str] | None,
+    ) -> tuple[list[Any], str]:
+        salvage = bridge_salvage_text(response_text)
+        if salvage:
+            return [], salvage
+        self._abandon_slot(model_id, tool_names)
+        raise CursorSDKError(
+            "Cursor returned a tool call Hermes could not translate and no "
+            "usable text. The Cursor agent was dropped; retrying cold. "
+            f"Model said: {_bridge_excerpt(response_text)}",
+            status_code=502,
+        )
+
     def _run_prompt(self, prompt_text: str, *, model: str) -> str:
         """Test hook / oneshot path: one Agent.prompt, no session cache."""
         return self._run_turn(prompt_text, model=model, resume=False, oneshot=True)
@@ -1138,6 +1387,7 @@ class CursorSDKClient:
         oneshot: bool = False,
         images: list[dict[str, Any]] | None = None,
         slot: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         if not self.api_key:
             raise CursorSDKError(
@@ -1170,17 +1420,54 @@ class CursorSDKClient:
             cwd = str(Path.cwd().resolve())
 
         selection = cursor_sdk_model(model)
-        options = {
-            "model": selection,
-            "api_key": self.api_key,
-            "local": {"cwd": cwd},
-            "mcp_servers": {},
-            "tools": [],
-        }
         log.debug("Cursor model selection: %s", json.dumps(selection, sort_keys=True))
 
         self._last_usage = None
+        self._last_captures = []
+
+        def _options_for(bucket: list[Any]) -> dict[str, Any]:
+            # SendOptions carries no tools/custom_tools, so the create-time
+            # surface is the whole life of the Agent.
+            # Documented cursor-sdk semantics (cursor.com/docs/sdk/python):
+            # `tools=[]` offers no built-in tools and the model can only
+            # respond with text. Deny wins: when `tools` is set, a tool must
+            # be listed. Custom tools ride the built-in `custom-user-tools`
+            # MCP server and are gated by the `mcp` capability group —
+            # omitting `mcp` hides Hermes `local.custom_tools`, so Part 1
+            # captures never fire. `tools=["mcp"]` + `mcp_servers={}`
+            # exposes ONLY those Hermes custom tools; Cursor shell/read/edit
+            # stay off.
+            # Assumption not live-verified in this change — a Cursor-hosted
+            # session test is still required before merge.
+            return {
+                "model": selection,
+                "api_key": self.api_key,
+                "local": {
+                    "cwd": cwd,
+                    "custom_tools": _hermes_custom_tools(tools, bucket),
+                },
+                "mcp_servers": {},
+                "tools": ["mcp"],
+            }
+
+        def _finish_turn(text: str, *sources: Any, bucket: list[Any]) -> str:
+            events = _collect_run_tool_events(*sources) if sources else []
+            self._last_captures = _dedup_tool_events(list(bucket) + events)
+            if sources:
+                _raise_for_failed_run(*sources)
+            if self._last_captures:
+                return text
+            detail = _run_failure_detail(*sources) if sources else ""
+            combined = "\n".join(
+                part for part in (text, detail) if part and str(part).strip()
+            )
+            if _looks_like_untranslated_bridge_markup(combined):
+                return combined
+            return text
+
         if oneshot:
+            capture_bucket: list[Any] = []
+            options = _options_for(capture_bucket)
             try:
                 result = Agent.prompt(
                     _cursor_user_message(prompt_text, images), options=options
@@ -1188,17 +1475,22 @@ class CursorSDKClient:
             except Exception as exc:
                 raise cursor_sdk_error(exc, phase="prompt") from exc
             self._last_usage = _cursor_token_usage(result)
-            _raise_for_failed_run(result)
             text = getattr(result, "result", None)
-            if isinstance(text, str):
-                return text
-            return "" if text is None else str(text)
+            if not isinstance(text, str):
+                text = "" if text is None else str(text)
+            return _finish_turn(text, result, bucket=capture_bucket)
 
-        slot = slot or self._slot_key(model)
+        slot = slot or self._slot_key(model, frozenset(_hermes_tool_names(tools)))
         rec = _slot_record(slot)
         _evict_idle_slots(slot)
         run = None
         with rec["lock"]:
+            bucket = rec.get("captures")
+            if not isinstance(bucket, list):
+                bucket = []
+                rec["captures"] = bucket
+            bucket.clear()
+            options = _options_for(bucket)
             _cancel_run(rec)
             try:
                 if rec.get("agent") is None:
@@ -1230,8 +1522,12 @@ class CursorSDKClient:
                 except Exception as exc:
                     raise cursor_sdk_error(exc, phase="run") from exc
             self._last_usage = _cursor_token_usage(waited) or _cursor_token_usage(run)
-            _raise_for_failed_run(waited, run)
             text = _run_text(run, waited)
+            text = _finish_turn(text, waited, run, bucket=bucket)
+            if self._last_captures:
+                return text
+            if _looks_like_untranslated_bridge_markup(text):
+                return text
             if not text.strip():
                 # A silent turn reads as a hung Hermes. Drop the agent so the
                 # retry cold-starts with the full window instead of a delta
